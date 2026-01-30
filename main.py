@@ -4,37 +4,36 @@ import json
 import asyncio
 import aiohttp
 import aiofiles
+import yt_dlp
 from urllib.parse import unquote
 from pyrogram import Client, filters
-from pyrogram.types import Message
 from aiohttp import web
 
 # --- Environment Variables ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", 0)) # Apna Telegram ID daalna zaroori hai
+OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 PORT = int(os.environ.get("PORT", 8080))
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- Memory Database (Temporary) ---
-# Note: Render Free Tier restart hone par ye data reset ho jayega.
-# Permanent ke liye MongoDB lagana padega.
+# --- Memory Database ---
 users_db = {} 
-active_tasks = {} # Format: {user_id: count}
+active_tasks = {}
 PRICE_MESSAGE = "Contact Owner for Premium Prices."
 
-# --- Constants ---
-FREE_LIMIT_SIZE = 300 * 1024 * 1024  # 300 MB
-PREM_LIMIT_SIZE = 650 * 1024 * 1024  # 650 MB
+# --- Limits ---
+FREE_LIMIT_SIZE = 300 * 1024 * 1024
+PREM_LIMIT_SIZE = 650 * 1024 * 1024
+YTDLP_LIMIT_SIZE = 500 * 1024 * 1024 # 500MB Limit for yt-dlp
 FREE_TASK_LIMIT = 1
 PREM_TASK_LIMIT = 2
 
 # --- Web Server ---
 async def web_server():
     async def handle(request):
-        return web.Response(text="Bot is Running with Admin Panel!")
+        return web.Response(text="Bot is Running with Pixeldrain & yt-dlp!")
     server = web.Application()
     server.router.add_get("/", handle)
     runner = web.AppRunner(server)
@@ -43,18 +42,16 @@ async def web_server():
     await site.start()
     print(f"Web server started on port {PORT}")
 
-# --- Helper: User Management ---
+# --- Helper Functions ---
 def get_user(user_id):
     if user_id not in users_db:
         users_db[user_id] = {"premium": False, "banned": False}
     return users_db[user_id]
 
 def update_user(user_id, key, value):
-    if user_id not in users_db:
-        users_db[user_id] = {"premium": False, "banned": False}
+    if user_id not in users_db: users_db[user_id] = {"premium": False, "banned": False}
     users_db[user_id][key] = value
 
-# --- Helper: Progress Bar ---
 def humanbytes(size):
     if not size: return ""
     power = 2**10
@@ -81,9 +78,9 @@ async def progress(current, total, message, start_time, action_type):
     diff = now - start_time
     if round(diff % 8.00) == 0 or current == total:
         percentage = current * 100 / total
-        speed = current / diff
+        speed = current / diff if diff > 0 else 0
         elapsed_time = round(diff) * 1000
-        time_to_completion = round((total - current) / speed) * 1000
+        time_to_completion = round((total - current) / speed) * 1000 if speed > 0 else 0
         
         filled_blocks = int(percentage // 10) 
         empty_blocks = 10 - filled_blocks
@@ -99,8 +96,13 @@ async def progress(current, total, message, start_time, action_type):
         except:
             pass
 
-# --- Downloader ---
+# --- 1. Normal Downloader (Direct Links + Pixeldrain) ---
 async def download_file(url, message, start_time):
+    # Pixeldrain Auto-Convert Logic
+    if "pixeldrain.com/u/" in url:
+        file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
+        url = f"https://pixeldrain.com/api/file/{file_id}"
+    
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             if response.status == 200:
@@ -130,15 +132,41 @@ async def download_file(url, message, start_time):
                 return file_name, total_size
     return None, 0
 
-# --- Admin/Owner Commands ---
+# --- 2. yt-dlp Downloader (YouTube, Insta, etc) ---
+async def download_ytdlp(url, message):
+    # Running blocking code in a separate thread
+    loop = asyncio.get_event_loop()
+    
+    def run_download():
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best', # Best MP4 to avoid ffmpeg merging issues
+            'outtmpl': '%(title)s.%(ext)s',
+            'max_filesize': YTDLP_LIMIT_SIZE, # 500MB Limit
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            return filename
+
+    try:
+        # Show static message because yt-dlp progress is hard to sync perfectly in thread
+        await message.edit_text("📥 **Downloading via yt-dlp...**\n\n(Progress bar not available for yt-dlp links)\nPlease Wait...")
+        file_path = await loop.run_in_executor(None, run_download)
+        return file_path
+    except Exception as e:
+        print(f"Yt-dlp Error: {e}")
+        return None
+
+# --- Admin Commands ---
 @app.on_message(filters.command("addprem") & filters.user(OWNER_ID))
 async def add_premium(client, message):
     try:
         user_id = int(message.command[1])
         update_user(user_id, "premium", True)
         await message.reply_text(f"✅ User `{user_id}` is now **Premium**!")
-    except:
-        await message.reply_text("Usage: `/addprem user_id`")
+    except: await message.reply_text("Usage: `/addprem user_id`")
 
 @app.on_message(filters.command("remprem") & filters.user(OWNER_ID))
 async def remove_premium(client, message):
@@ -146,134 +174,83 @@ async def remove_premium(client, message):
         user_id = int(message.command[1])
         update_user(user_id, "premium", False)
         await message.reply_text(f"❌ User `{user_id}` removed from Premium.")
-    except:
-        await message.reply_text("Usage: `/remprem user_id`")
+    except: await message.reply_text("Usage: `/remprem user_id`")
 
-@app.on_message(filters.command("ban") & filters.user(OWNER_ID))
-async def ban_user(client, message):
-    try:
-        user_id = int(message.command[1])
-        update_user(user_id, "banned", True)
-        await message.reply_text(f"🚫 User `{user_id}` has been **BANNED**.")
-    except:
-        await message.reply_text("Usage: `/ban user_id`")
-
-@app.on_message(filters.command("unban") & filters.user(OWNER_ID))
-async def unban_user(client, message):
-    try:
-        user_id = int(message.command[1])
-        update_user(user_id, "banned", False)
-        await message.reply_text(f"✅ User `{user_id}` has been **UNBANNED**.")
-    except:
-        await message.reply_text("Usage: `/unban user_id`")
-
-@app.on_message(filters.command("setprice") & filters.user(OWNER_ID))
-async def set_price(client, message):
-    global PRICE_MESSAGE
-    if len(message.command) > 1:
-        PRICE_MESSAGE = message.text.split(None, 1)[1]
-        await message.reply_text(f"✅ Price message updated:\n\n{PRICE_MESSAGE}")
-    else:
-        await message.reply_text("Usage: `/setprice Your Message Here`")
-
-@app.on_message(filters.command("users") & filters.user(OWNER_ID))
-async def stats(client, message):
-    await message.reply_text(f"📊 Total Users in Memory: {len(users_db)}")
-
-# --- User Commands ---
-@app.on_message(filters.command("start"))
-async def start(client, message):
-    user = get_user(message.from_user.id)
-    status = "🌟 PREMIUM" if user['premium'] else "👤 FREE"
-    text = f"👋 **Hello {message.from_user.first_name}!**\n\n" \
-           f"Your Status: **{status}**\n\n" \
-           f"**📝 Limits:**\n" \
-           f"👤 Free: Max 300MB, 1 Task\n" \
-           f"🌟 Premium: Max 650MB, 2 Tasks\n\n" \
-           f"Send a link to start!"
-    await message.reply_text(text)
-
-@app.on_message(filters.command("plan") | filters.command("upgrade"))
-async def plan_info(client, message):
-    await message.reply_text(f"💎 **Premium Plan Info**\n\n{PRICE_MESSAGE}")
-
-# --- Main Logic ---
+# --- Main Handler ---
 @app.on_message(filters.text & filters.private)
 async def upload_handler(client, message):
     user_id = message.from_user.id
     user_data = get_user(user_id)
     url = message.text
 
-    # 1. Check Ban
     if user_data['banned']:
-        await message.reply_text("🚫 You are BANNED from using this bot.")
+        await message.reply_text("🚫 You are BANNED.")
         return
-
     if not url.startswith("http"):
         return
 
-    # 2. Check Active Tasks
+    # Task Check
     current_tasks = active_tasks.get(user_id, 0)
     task_limit = PREM_TASK_LIMIT if user_data['premium'] else FREE_TASK_LIMIT
-    
     if current_tasks >= task_limit:
-        await message.reply_text(f"⚠️ **Busy!** You have reached your task limit ({task_limit}). Wait for completion.")
+        await message.reply_text(f"⚠️ **Busy!** Task limit reached ({task_limit}).")
         return
 
-    # 3. Size Check (HEAD Request)
-    msg = await message.reply_text("🔄 **Checking Link...**")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.head(url) as resp:
-                size = int(resp.headers.get('content-length', 0))
-    except:
-        size = 0 # Cannot detect size
-    
-    size_limit = PREM_LIMIT_SIZE if user_data['premium'] else FREE_LIMIT_SIZE
-    
-    if size > size_limit:
-        limit_mb = size_limit / (1024*1024)
-        await msg.edit_text(f"❌ **File too Big!**\nYour Limit: {limit_mb} MB\nFile Size: {humanbytes(size)}\n\nType /plan to upgrade.")
-        return
-
-    # --- Start Task ---
+    msg = await message.reply_text("🔄 **Processing...**")
     active_tasks[user_id] = current_tasks + 1
-    start_time = time.time()
+    
     file_path = None
     
     try:
-        # Download
-        file_path, actual_size = await download_file(url, msg, start_time)
+        # 1. Check if URL is supported by yt-dlp (YouTube, Insta, FB, etc)
+        # We assume common social sites are for yt-dlp, direct links for standard
+        is_ytdlp = False
+        ytdlp_domains = ["youtube.com", "youtu.be", "instagram.com", "facebook.com", "twitter.com", "x.com", "tiktok.com"]
         
-        # Check size again after download (if HEAD failed)
-        if actual_size > size_limit:
-            await msg.edit_text(f"❌ **File too Big!** Detected after download.\nYour Limit: {limit_mb} MB")
-            os.remove(file_path)
-            return
-
-        if file_path:
-            await msg.edit_text(f"✅ Downloaded. **Uploading...**")
-            up_start_time = time.time()
-            
-            await message.reply_document(
-                document=file_path,
-                caption=f"📂 `{file_path}`\n👤 Uploaded by: {message.from_user.mention}",
-                progress=progress,
-                progress_args=(msg, up_start_time, "📤 Uploading...")
-            )
-            await msg.delete()
-            os.remove(file_path)
+        if any(domain in url for domain in ytdlp_domains):
+            is_ytdlp = True
+            file_path = await download_ytdlp(url, msg)
         else:
-            await msg.edit_text("❌ Failed to Download.")
+            # 2. Standard Download (includes Pixeldrain logic)
+            start_time = time.time()
+            file_path, size = await download_file(url, msg, start_time)
+            
+            # Size Check for direct links
+            size_limit = PREM_LIMIT_SIZE if user_data['premium'] else FREE_LIMIT_SIZE
+            if size > size_limit:
+                await msg.edit_text(f"❌ **File too Big!** Limit: {size_limit/(1024*1024):.1f}MB")
+                if file_path: os.remove(file_path)
+                file_path = None
+
+        # 3. Upload Logic
+        if file_path and os.path.exists(file_path):
+            # Check file size before upload (for yt-dlp files)
+            file_size = os.path.getsize(file_path)
+            limit_to_check = PREM_LIMIT_SIZE if user_data['premium'] else FREE_LIMIT_SIZE
+            
+            if file_size > limit_to_check:
+                await msg.edit_text(f"❌ **File too Big!**\nDetected: {humanbytes(file_size)}\nLimit: {humanbytes(limit_to_check)}")
+                os.remove(file_path)
+            else:
+                await msg.edit_text("✅ Downloaded. **Uploading...**")
+                up_start_time = time.time()
+                await message.reply_document(
+                    document=file_path,
+                    caption=f"📂 `{os.path.basename(file_path)}`\n👤 {message.from_user.first_name}",
+                    progress=progress,
+                    progress_args=(msg, up_start_time, "📤 Uploading...")
+                )
+                await msg.delete()
+                os.remove(file_path)
+        elif not is_ytdlp:
+            # Error msg only if standard DL failed (yt-dlp handles its own errors)
+            await msg.edit_text("❌ Download Failed!")
 
     except Exception as e:
         await msg.edit_text(f"⚠️ Error: {str(e)}")
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+        if file_path and os.path.exists(file_path): os.remove(file_path)
     finally:
-        # Task complete - free up slot
-        if user_id in active_tasks:
-            active_tasks[user_id] -= 1
+        if user_id in active_tasks: active_tasks[user_id] -= 1
 
 if __name__ == "__main__":
     print("Bot Started...")
