@@ -39,9 +39,8 @@ aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
 abort_dict = {}
 YTDLP_LIMIT = 1500 * 1024 * 1024
 
-# --- Database Functions (FIXED) ---
+# --- Database Functions (CRITICAL FIX) ---
 async def get_config():
-    # FIX: Check explicitly for None
     if mongo_db is None: 
         return {"auth_users": [], "dump_id": 0}
     
@@ -52,24 +51,21 @@ async def get_config():
     return data
 
 async def add_user_db(user_id):
-    # FIX: Check explicitly for Not None
     if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$addToSet": {"auth_users": user_id}}, upsert=True)
 
 async def remove_user_db(user_id):
-    # FIX: Check explicitly for Not None
     if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$pull": {"auth_users": user_id}})
 
 async def set_dump_db(chat_id):
-    # FIX: Check explicitly for Not None
     if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$set": {"dump_id": chat_id}}, upsert=True)
 
 # --- Web Server ---
 from aiohttp import web
 async def web_server():
-    async def handle(request): return web.Response(text="Bot Running with MongoDB Fix!")
+    async def handle(request): return web.Response(text="Bot Running with Auth Fix!")
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -172,7 +168,7 @@ async def upload_file(client, message, file_path, user_mention, dump_id):
 
 # --- Download Logic ---
 async def download_logic(url, message, user_id, mode):
-    # Pixeldrain check
+    # Pixeldrain Check
     if "pixeldrain.com/u/" in url:
         try: 
             file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
@@ -328,21 +324,30 @@ async def set_dump(c, m):
         except Exception as e: await m.reply_text(f"⚠️ ID Set, but Bot can't send msg.\nError: `{e}`")
     except: await m.reply_text("Usage: `/setchatid -100xxxxxxx`")
 
+# --- AUTH SYSTEM (Debugged) ---
 @app.on_message(filters.command(["auth", "unban"]) & filters.user(OWNER_ID))
 async def unban_user(c, m):
     try:
+        if len(m.command) < 2:
+            await m.reply_text("Usage: `/auth user_id`")
+            return
         uid = int(m.command[1])
         await add_user_db(uid)
         await m.reply_text(f"✅ User `{uid}` Authorized!")
-    except: await m.reply_text("Usage: `/auth user_id`")
+    except Exception as e: 
+        await m.reply_text(f"❌ Error: {e}")
 
 @app.on_message(filters.command(["unauth", "ban"]) & filters.user(OWNER_ID))
 async def ban_user(c, m):
     try:
+        if len(m.command) < 2:
+            await m.reply_text("Usage: `/ban user_id`")
+            return
         uid = int(m.command[1])
         await remove_user_db(uid)
         await m.reply_text(f"🚫 User `{uid}` Banned!")
-    except: await m.reply_text("Usage: `/ban user_id`")
+    except Exception as e:
+         await m.reply_text(f"❌ Error: {e}")
 
 @app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
 async def broadcast_msg(c, m):
@@ -378,3 +383,4 @@ async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Ca
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
+                                    
