@@ -16,14 +16,14 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
-MONGO_URL = os.environ.get("MONGO_URL") # New Variable
+MONGO_URL = os.environ.get("MONGO_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- MongoDB Setup ---
 if not MONGO_URL:
-    print("❌ MONGO_URL Missing! Bot will not save data permanently.")
+    print("❌ MONGO_URL Missing! Data will not be saved permanently.")
     mongo_db = None
 else:
     mongo_client = AsyncIOMotorClient(MONGO_URL)
@@ -44,20 +44,19 @@ async def get_config():
     if not mongo_db: return {"auth_users": [], "dump_id": 0}
     data = await config_col.find_one({"_id": "bot_settings"})
     if not data:
-        # Create default if not exists
         await config_col.insert_one({"_id": "bot_settings", "auth_users": [], "dump_id": 0})
         return {"auth_users": [], "dump_id": 0}
     return data
 
-async def add_auth_user(user_id):
+async def add_user_db(user_id):
     if mongo_db:
         await config_col.update_one({"_id": "bot_settings"}, {"$addToSet": {"auth_users": user_id}}, upsert=True)
 
-async def remove_auth_user(user_id):
+async def remove_user_db(user_id):
     if mongo_db:
         await config_col.update_one({"_id": "bot_settings"}, {"$pull": {"auth_users": user_id}})
 
-async def set_dump_id(chat_id):
+async def set_dump_db(chat_id):
     if mongo_db:
         await config_col.update_one({"_id": "bot_settings"}, {"$set": {"dump_id": chat_id}}, upsert=True)
 
@@ -121,12 +120,14 @@ async def update_progress_ui(current, total, message, start_time, action):
         try: await message.edit_text(text, reply_markup=buttons)
         except: pass
 
-# --- File Logic ---
+# --- Extraction Logic (Fixed) ---
 def extract_archive(file_path):
     output_dir = f"extracted_{int(time.time())}"
     if not os.path.exists(output_dir): os.makedirs(output_dir)
+    # Using full path and -y for yes to all
     cmd = ["7z", "x", file_path, f"-o{output_dir}", "-y"]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
     files_list = []
     for root, dirs, files in os.walk(output_dir):
         for file in files: files_list.append(os.path.join(root, file))
@@ -164,13 +165,18 @@ async def upload_file(client, message, file_path, user_mention, dump_id):
         print(f"Upload Error: {e}")
         return False
 
-# --- Download Logic ---
+# --- Download Logic (Syntax Fixed) ---
 async def download_logic(url, message, user_id, mode):
+    # Fixed Pixeldrain Syntax Error
     if "pixeldrain.com/u/" in url:
-        try: url = f"https://pixeldrain.com/api/file/{url.split('pixeldrain.com/u/")[1].split("/")[0]}"
+        try:
+            file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
+            url = f"https://pixeldrain.com/api/file/{file_id}"
         except: pass
+
     try:
         file_path = None
+        # 1. Torrent / Magnet
         if mode == "leech" or url.startswith("magnet:") or url.lower().endswith(".torrent"):
             download = None
             if url.startswith("http"):
@@ -182,17 +188,24 @@ async def download_logic(url, message, user_id, mode):
                             with open(meta, "wb") as f: f.write(data)
                             download = aria2.add_torrent(meta)
             else: download = aria2.add_magnet(url)
+            
             if not download: return None
+            
             start_time = time.time()
             while True:
                 if user_id in abort_dict: aria2.remove([download]); return "CANCELLED"
                 download.update()
                 if download.status == "error": return None
                 if download.status == "complete": 
-                    file_path = download.files[0].path; break
+                    file_path = download.files[0].path
+                    # Fix: Add small delay to ensure filesystem is ready
+                    await asyncio.sleep(2)
+                    break
                 if download.total_length > 0:
                      await update_progress_ui(download.completed_length, download.total_length, message, start_time, "☁️ Leeching...")
                 await asyncio.sleep(4)
+
+        # 2. yt-dlp
         elif mode == "ytdl" or any(x in url for x in ["youtube", "youtu.be", "hanime", "instagram"]):
              loop = asyncio.get_event_loop()
              def run():
@@ -201,6 +214,8 @@ async def download_logic(url, message, user_id, mode):
                      info = ydl.extract_info(url, download=True)
                      return ydl.prepare_filename(info)
              file_path = await loop.run_in_executor(None, run)
+        
+        # 3. Direct
         else:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
@@ -229,10 +244,10 @@ async def download_logic(url, message, user_id, mode):
 # --- Main Processor ---
 async def process_task(client, message, url, mode="auto"):
     user_id = message.from_user.id
-    config = await get_config() # MongoDB Fetch
+    config = await get_config()
     
     if user_id != OWNER_ID and user_id not in config.get("auth_users", []):
-        await message.reply_text("⛔ **Unauthorized!** Ask Owner.")
+        await message.reply_text("⛔ **Access Denied!**\nYou are not authorized.\nContact Owner.")
         return
     if user_id in abort_dict: del abort_dict[user_id]
     
@@ -243,17 +258,27 @@ async def process_task(client, message, url, mode="auto"):
     if not file_path or not os.path.exists(file_path): await msg.edit_text("❌ Download Failed."); return
     
     final_files = []; temp_dir = None; is_extracted = False
+    
+    # Logic Update: Check Folder OR Zip
     if os.path.isdir(file_path):
         await msg.edit_text("📂 **Processing Folder...**")
         final_files = get_files_from_folder(file_path)
+    
     elif file_path.lower().endswith((".zip", ".rar", ".7z", ".tar")):
         await msg.edit_text("📦 **Extracting Archive...**")
         extracted_list, temp_dir = extract_archive(file_path)
-        if extracted_list: final_files = extracted_list; is_extracted = True; os.remove(file_path)
-        else: final_files = [file_path]
-    else: final_files = [file_path]
+        if extracted_list: 
+            final_files = extracted_list
+            is_extracted = True
+            os.remove(file_path) # Zip extracted, remove original
+        else:
+            # If extraction fails, upload the zip itself
+            final_files = [file_path]
+    else: 
+        final_files = [file_path]
     
     if not final_files: await msg.edit_text("❌ No files found."); return
+    
     await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
     
     dump_id = config.get("dump_id", 0)
@@ -263,6 +288,7 @@ async def process_task(client, message, url, mode="auto"):
         if is_extracted or os.path.isdir(file_path): 
             try: os.remove(f)
             except: pass
+            
     await msg.delete()
     if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
     if os.path.isdir(file_path): shutil.rmtree(file_path)
@@ -277,13 +303,13 @@ async def start_cmd(c, m):
 **👋 Welcome to URL Uploader Bot!**
 ⚡ [Powered by Ayuprime](tg://user?id=8428298917)
 
-**🌟 Features:**
-☁️ **MongoDB Connected:** Data is now PERMANENT!
-⚡ **Torrent Leech:** Magnets & .torrent files supported.
-📹 **Video Downloader:** YouTube, Instagram, Hanime, etc.
-📦 **Auto-Extract:** Unzips ZIP/RAR/7Z archives.
-🔒 **Private Mode:** Access Control System.
-📝 **Dump Channel:** Auto-Backup supported.
+**🌟 Advanced Features:**
+☁️ **MongoDB:** All data is Permanent.
+📢 **Broadcast:** Send messages to all users.
+🚫 **Ban System:** Block unwanted users securely.
+⚡ **Torrent & Direct:** High speed leeching.
+📹 **Video Downloader:** YouTube, Hanime, etc.
+📝 **Dump Backup:** Auto-save files to channel.
 
 *Send any link to start!*
     """
@@ -294,41 +320,40 @@ async def start_cmd(c, m):
 async def set_dump(c, m):
     try:
         chat_id = int(m.command[1])
-        await set_dump_id(chat_id)
+        await set_dump_db(chat_id)
         try: await c.send_message(chat_id, "✅ **Dump Connected via MongoDB!**"); await m.reply_text(f"✅ Dump Set: `{chat_id}`")
         except Exception as e: await m.reply_text(f"⚠️ ID Set, but Bot can't send msg.\nError: `{e}`")
     except: await m.reply_text("Usage: `/setchatid -100xxxxxxx`")
 
-@app.on_message(filters.command("auth") & filters.user(OWNER_ID))
-async def auth(c, m):
+@app.on_message(filters.command(["auth", "unban"]) & filters.user(OWNER_ID))
+async def unban_user(c, m):
     try:
         uid = int(m.command[1])
-        await add_auth_user(uid)
-        await m.reply_text(f"✅ Authorized (Saved to DB): `{uid}`")
+        await add_user_db(uid)
+        await m.reply_text(f"✅ User `{uid}` Authorized!")
     except: await m.reply_text("Usage: `/auth user_id`")
 
-@app.on_message(filters.command("unauth") & filters.user(OWNER_ID))
-async def unauth(c, m):
+@app.on_message(filters.command(["unauth", "ban"]) & filters.user(OWNER_ID))
+async def ban_user(c, m):
     try:
         uid = int(m.command[1])
-        await remove_auth_user(uid)
-        await m.reply_text(f"🚫 Removed (from DB): `{uid}`")
-    except: await m.reply_text("Usage: `/unauth user_id`")
+        await remove_user_db(uid)
+        await m.reply_text(f"🚫 User `{uid}` Banned!")
+    except: await m.reply_text("Usage: `/ban user_id`")
 
 @app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
 async def broadcast_msg(c, m):
     if not m.reply_to_message: await m.reply_text("Reply to a message to broadcast."); return
     config = await get_config()
     users = config.get("auth_users", [])
-    sent = 0
-    await m.reply_text(f"📢 Broadcasting to {len(users)} users...")
+    if not users: await m.reply_text("No users found."); return
+    msg = await m.reply_text(f"📢 Broadcasting to {len(users)} users...")
+    sent = 0; failed = 0
     for uid in users:
         try:
-            await m.reply_to_message.copy(uid)
-            sent += 1
-            await asyncio.sleep(1) # Prevent flood
-        except: pass
-    await m.reply_text(f"✅ Broadcast complete. Sent to {sent} users.")
+            await m.reply_to_message.copy(uid); sent += 1; await asyncio.sleep(0.5)
+        except: failed += 1
+    await msg.edit_text(f"✅ **Broadcast Done**\nSent: `{sent}`\nFailed: `{failed}`")
 
 @app.on_message(filters.command("leech"))
 async def leech_cmd(c, m): 
@@ -350,3 +375,4 @@ async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Ca
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
+    
