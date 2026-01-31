@@ -3,3 +3,4 @@ tgcrypto
 aiohttp
 aiofiles
 yt-dlp
+aria2p
