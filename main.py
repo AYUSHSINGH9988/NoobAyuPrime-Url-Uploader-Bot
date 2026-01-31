@@ -13,7 +13,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- Environment Variables ---
 API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH"))
+API_HASH = os.environ.get("API_HASH")  # Fixed: Extra bracket removed
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 PORT = int(os.environ.get("PORT", 8080))
@@ -21,6 +21,7 @@ PORT = int(os.environ.get("PORT", 8080))
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- Initialize Aria2 ---
+# Daemon start logic
 subprocess.Popen(['aria2c', '--enable-rpc', '--rpc-listen-port=6800', '--daemon'])
 time.sleep(1)
 aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
@@ -103,7 +104,6 @@ async def update_progress_ui(current, total, message, start_time, action):
         eta = round((total - current) / speed) if speed > 0 else 0
         
         filled = int(percentage // 10)
-        # Cloud Style Bar
         bar = '☁️' * filled + '◌' * (10 - filled)
         
         text = f"**{action}**\n\n"
@@ -136,19 +136,15 @@ async def upload_file(client, message, file_path, user_mention):
     try:
         file_name = os.path.basename(file_path)
         thumb_path = None
-        duration = 0
         
-        # Check if media
         is_video = file_name.lower().endswith(('.mp4', '.mkv', '.webm', '.avi'))
-        is_image = file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
         
         if is_video:
             thumb_path = await take_screenshot(file_path)
-            duration = await get_duration(file_path)
+            # Duration fetch removed from args to keep it simple/fast for bulk
         
         caption = f"☁️ **File:** `{file_name}`\n📦 **Size:** `{humanbytes(os.path.getsize(file_path))}`\n👤 **User:** {user_mention}"
         
-        # Upload
         sent_msg = await message.reply_document(
             document=file_path,
             caption=caption,
@@ -161,7 +157,7 @@ async def upload_file(client, message, file_path, user_mention):
         # Dump Logic
         if config["dump_id"] != 0:
             try: await sent_msg.copy(config["dump_id"])
-            except: pass # Silent fail for dump
+            except: pass 
             
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
         return True
@@ -173,8 +169,10 @@ async def upload_file(client, message, file_path, user_mention):
 async def download_logic(url, message, user_id, mode):
     # PixelDrain Fix
     if "pixeldrain.com/u/" in url:
-        file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
-        url = f"https://pixeldrain.com/api/file/{file_id}"
+        try:
+            file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
+            url = f"https://pixeldrain.com/api/file/{file_id}"
+        except: pass
 
     try:
         file_path = None
@@ -202,12 +200,6 @@ async def download_logic(url, message, user_id, mode):
                 if download.status == "error": return None
                 if download.status == "complete": 
                     file_path = download.files[0].path
-                    # If directory, find largest (logic simplification for zip extraction later)
-                    if os.path.isdir(file_path):
-                         # Find zip inside or handle folder? 
-                         # For now, aria2p usually returns path to file or dir.
-                         # We'll just pass path.
-                         pass
                     break
                 if download.total_length > 0:
                      await update_progress_ui(download.completed_length, download.total_length, message, start_time, "☁️ Leeching...")
@@ -229,10 +221,18 @@ async def download_logic(url, message, user_id, mode):
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         total = int(resp.headers.get("content-length", 0))
-                        name = url.split("/")[-1].split("?")[0]
-                        if "pixeldrain" in url: name = "pixeldrain_file" # Fallback, usually header has name
-                        if resp.headers.get("Content-Disposition"):
-                            name = resp.headers.get("Content-Disposition").split('filename=')[1].strip('"')
+                        
+                        # Filename Logic
+                        name = "downloaded_file"
+                        if "pixeldrain" in url: name = "pixeldrain_file"
+                        
+                        cd = resp.headers.get("Content-Disposition")
+                        if cd:
+                            try: name = cd.split('filename=')[1].strip('"')
+                            except: pass
+                        else:
+                            name = url.split("/")[-1].split("?")[0]
+                            
                         if "." not in name: name += ".mp4"
                         
                         file_path = name
@@ -282,18 +282,15 @@ async def process_task(client, message, url, mode="auto"):
         if extracted_list:
             final_files = extracted_list
             is_extracted = True
-            # Remove original archive to save space
-            os.remove(file_path)
+            os.remove(file_path) # Remove zip
     
     # --- Upload Loop ---
     await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
     
     for f in final_files:
-        # Ignore small system files or thumbnails
-        if os.path.getsize(f) < 1024: continue
-        
+        if os.path.getsize(f) < 1024: continue # Skip tiny files
         await upload_file(client, msg, f, message.from_user.mention)
-        if is_extracted: os.remove(f) # Clean up extracted files as we go
+        if is_extracted: os.remove(f)
     
     await msg.delete()
     if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
@@ -351,3 +348,4 @@ if __name__ == "__main__":
     app.start()
     app.loop.run_until_complete(web_server())
     app.loop.run_forever()
+        
