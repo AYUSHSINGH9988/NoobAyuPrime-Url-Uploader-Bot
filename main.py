@@ -39,10 +39,11 @@ aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
 abort_dict = {}
 YTDLP_LIMIT = 1500 * 1024 * 1024
 
-# --- Database Functions (FIXED HERE) ---
+# --- Database Functions (FIXED) ---
 async def get_config():
-    # Fix: Explicit check for None
-    if mongo_db is None: return {"auth_users": [], "dump_id": 0}
+    # FIX: Check explicitly for None
+    if mongo_db is None: 
+        return {"auth_users": [], "dump_id": 0}
     
     data = await config_col.find_one({"_id": "bot_settings"})
     if not data:
@@ -51,21 +52,24 @@ async def get_config():
     return data
 
 async def add_user_db(user_id):
+    # FIX: Check explicitly for Not None
     if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$addToSet": {"auth_users": user_id}}, upsert=True)
 
 async def remove_user_db(user_id):
+    # FIX: Check explicitly for Not None
     if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$pull": {"auth_users": user_id}})
 
 async def set_dump_db(chat_id):
+    # FIX: Check explicitly for Not None
     if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$set": {"dump_id": chat_id}}, upsert=True)
 
 # --- Web Server ---
 from aiohttp import web
 async def web_server():
-    async def handle(request): return web.Response(text="Bot Running with MongoDB!")
+    async def handle(request): return web.Response(text="Bot Running with MongoDB Fix!")
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -246,6 +250,7 @@ async def process_task(client, message, url, mode="auto"):
     user_id = message.from_user.id
     config = await get_config()
     
+    # Auth Check
     if user_id != OWNER_ID and user_id not in config.get("auth_users", []):
         await message.reply_text("⛔ **Access Denied!**\nYou are not authorized.\nContact Owner.")
         return
@@ -373,4 +378,3 @@ async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Ca
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
-            
