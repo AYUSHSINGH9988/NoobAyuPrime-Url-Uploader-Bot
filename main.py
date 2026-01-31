@@ -29,6 +29,7 @@ else:
     mongo_client = AsyncIOMotorClient(MONGO_URL)
     mongo_db = mongo_client["URL_Uploader_Bot"]
     config_col = mongo_db["config"]
+    users_col = mongo_db["users"] # Separate collection for users
 
 # --- Initialize Aria2 ---
 subprocess.Popen(['aria2c', '--enable-rpc', '--rpc-listen-port=6800', '--daemon'])
@@ -39,33 +40,33 @@ aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
 abort_dict = {}
 YTDLP_LIMIT = 1500 * 1024 * 1024
 
-# --- Database Functions (CRITICAL FIX) ---
-async def get_config():
-    if mongo_db is None: 
-        return {"auth_users": [], "dump_id": 0}
-    
-    data = await config_col.find_one({"_id": "bot_settings"})
-    if not data:
-        await config_col.insert_one({"_id": "bot_settings", "auth_users": [], "dump_id": 0})
-        return {"auth_users": [], "dump_id": 0}
-    return data
+# --- Database Functions (Auto-Save) ---
+async def get_dump_id():
+    if mongo_db is None: return 0
+    data = await config_col.find_one({"_id": "dump_settings"})
+    if not data: return 0
+    return data.get("chat_id", 0)
 
-async def add_user_db(user_id):
+async def set_dump_id(chat_id):
     if mongo_db is not None:
-        await config_col.update_one({"_id": "bot_settings"}, {"$addToSet": {"auth_users": user_id}}, upsert=True)
+        await config_col.update_one({"_id": "dump_settings"}, {"$set": {"chat_id": chat_id}}, upsert=True)
 
-async def remove_user_db(user_id):
+async def add_user_to_db(user_id):
+    # Auto-save user for Broadcast
     if mongo_db is not None:
-        await config_col.update_one({"_id": "bot_settings"}, {"$pull": {"auth_users": user_id}})
+        await users_col.update_one({"_id": user_id}, {"$set": {"active": True}}, upsert=True)
 
-async def set_dump_db(chat_id):
-    if mongo_db is not None:
-        await config_col.update_one({"_id": "bot_settings"}, {"$set": {"dump_id": chat_id}}, upsert=True)
+async def get_all_users():
+    if mongo_db is None: return []
+    users = []
+    async for doc in users_col.find():
+        users.append(doc["_id"])
+    return users
 
 # --- Web Server ---
 from aiohttp import web
 async def web_server():
-    async def handle(request): return web.Response(text="Bot Running with Auth Fix!")
+    async def handle(request): return web.Response(text="Bot Running with MongoDB (No Auth)!")
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -244,12 +245,10 @@ async def download_logic(url, message, user_id, mode):
 # --- Main Processor ---
 async def process_task(client, message, url, mode="auto"):
     user_id = message.from_user.id
-    config = await get_config()
     
-    # Auth Check
-    if user_id != OWNER_ID and user_id not in config.get("auth_users", []):
-        await message.reply_text("⛔ **Access Denied!**\nYou are not authorized.\nContact Owner.")
-        return
+    # 1. AUTO-SAVE USER (No Auth Needed)
+    await add_user_to_db(user_id)
+    
     if user_id in abort_dict: del abort_dict[user_id]
     
     msg = await message.reply_text("☁️ **Connecting to Cloud...**")
@@ -280,7 +279,8 @@ async def process_task(client, message, url, mode="auto"):
     
     await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
     
-    dump_id = config.get("dump_id", 0)
+    dump_id = await get_dump_id() # Fetch from DB
+    
     for f in final_files:
         if os.path.getsize(f) < 1024*10: continue
         await upload_file(client, msg, f, message.from_user.mention, dump_id)
@@ -297,6 +297,9 @@ async def process_task(client, message, url, mode="auto"):
 # --- Commands ---
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
+    # Auto-save user on start too
+    await add_user_to_db(m.from_user.id)
+    
     photo_path = "start_img.jpg" 
     caption = """
 **👋 Welcome to URL Uploader Bot!**
@@ -305,7 +308,6 @@ async def start_cmd(c, m):
 **🌟 Advanced Features:**
 ☁️ **MongoDB:** All data is Permanent.
 📢 **Broadcast:** Send messages to all users.
-🚫 **Ban System:** Block unwanted users securely.
 ⚡ **Torrent & Direct:** High speed leeching.
 📹 **Video Downloader:** YouTube, Hanime, etc.
 📝 **Dump Backup:** Auto-save files to channel.
@@ -319,42 +321,16 @@ async def start_cmd(c, m):
 async def set_dump(c, m):
     try:
         chat_id = int(m.command[1])
-        await set_dump_db(chat_id)
+        await set_dump_id(chat_id)
         try: await c.send_message(chat_id, "✅ **Dump Connected via MongoDB!**"); await m.reply_text(f"✅ Dump Set: `{chat_id}`")
         except Exception as e: await m.reply_text(f"⚠️ ID Set, but Bot can't send msg.\nError: `{e}`")
     except: await m.reply_text("Usage: `/setchatid -100xxxxxxx`")
 
-# --- AUTH SYSTEM (Debugged) ---
-@app.on_message(filters.command(["auth", "unban"]) & filters.user(OWNER_ID))
-async def unban_user(c, m):
-    try:
-        if len(m.command) < 2:
-            await m.reply_text("Usage: `/auth user_id`")
-            return
-        uid = int(m.command[1])
-        await add_user_db(uid)
-        await m.reply_text(f"✅ User `{uid}` Authorized!")
-    except Exception as e: 
-        await m.reply_text(f"❌ Error: {e}")
-
-@app.on_message(filters.command(["unauth", "ban"]) & filters.user(OWNER_ID))
-async def ban_user(c, m):
-    try:
-        if len(m.command) < 2:
-            await m.reply_text("Usage: `/ban user_id`")
-            return
-        uid = int(m.command[1])
-        await remove_user_db(uid)
-        await m.reply_text(f"🚫 User `{uid}` Banned!")
-    except Exception as e:
-         await m.reply_text(f"❌ Error: {e}")
-
 @app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
 async def broadcast_msg(c, m):
     if not m.reply_to_message: await m.reply_text("Reply to a message to broadcast."); return
-    config = await get_config()
-    users = config.get("auth_users", [])
-    if not users: await m.reply_text("No users found."); return
+    users = await get_all_users()
+    if not users: await m.reply_text("No users found in DB."); return
     msg = await m.reply_text(f"📢 Broadcasting to {len(users)} users...")
     sent = 0; failed = 0
     for uid in users:
@@ -383,4 +359,4 @@ async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Ca
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
-                                    
+        
