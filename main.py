@@ -39,9 +39,11 @@ aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
 abort_dict = {}
 YTDLP_LIMIT = 1500 * 1024 * 1024
 
-# --- Database Functions ---
+# --- Database Functions (FIXED HERE) ---
 async def get_config():
-    if not mongo_db: return {"auth_users": [], "dump_id": 0}
+    # Fix: Explicit check for None
+    if mongo_db is None: return {"auth_users": [], "dump_id": 0}
+    
     data = await config_col.find_one({"_id": "bot_settings"})
     if not data:
         await config_col.insert_one({"_id": "bot_settings", "auth_users": [], "dump_id": 0})
@@ -49,15 +51,15 @@ async def get_config():
     return data
 
 async def add_user_db(user_id):
-    if mongo_db:
+    if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$addToSet": {"auth_users": user_id}}, upsert=True)
 
 async def remove_user_db(user_id):
-    if mongo_db:
+    if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$pull": {"auth_users": user_id}})
 
 async def set_dump_db(chat_id):
-    if mongo_db:
+    if mongo_db is not None:
         await config_col.update_one({"_id": "bot_settings"}, {"$set": {"dump_id": chat_id}}, upsert=True)
 
 # --- Web Server ---
@@ -120,11 +122,10 @@ async def update_progress_ui(current, total, message, start_time, action):
         try: await message.edit_text(text, reply_markup=buttons)
         except: pass
 
-# --- Extraction Logic (Fixed) ---
+# --- Extraction Logic ---
 def extract_archive(file_path):
     output_dir = f"extracted_{int(time.time())}"
     if not os.path.exists(output_dir): os.makedirs(output_dir)
-    # Using full path and -y for yes to all
     cmd = ["7z", "x", file_path, f"-o{output_dir}", "-y"]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
@@ -165,11 +166,11 @@ async def upload_file(client, message, file_path, user_mention, dump_id):
         print(f"Upload Error: {e}")
         return False
 
-# --- Download Logic (Syntax Fixed) ---
+# --- Download Logic ---
 async def download_logic(url, message, user_id, mode):
-    # Fixed Pixeldrain Syntax Error
+    # Pixeldrain check
     if "pixeldrain.com/u/" in url:
-        try:
+        try: 
             file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
             url = f"https://pixeldrain.com/api/file/{file_id}"
         except: pass
@@ -198,7 +199,6 @@ async def download_logic(url, message, user_id, mode):
                 if download.status == "error": return None
                 if download.status == "complete": 
                     file_path = download.files[0].path
-                    # Fix: Add small delay to ensure filesystem is ready
                     await asyncio.sleep(2)
                     break
                 if download.total_length > 0:
@@ -259,7 +259,6 @@ async def process_task(client, message, url, mode="auto"):
     
     final_files = []; temp_dir = None; is_extracted = False
     
-    # Logic Update: Check Folder OR Zip
     if os.path.isdir(file_path):
         await msg.edit_text("📂 **Processing Folder...**")
         final_files = get_files_from_folder(file_path)
@@ -270,9 +269,8 @@ async def process_task(client, message, url, mode="auto"):
         if extracted_list: 
             final_files = extracted_list
             is_extracted = True
-            os.remove(file_path) # Zip extracted, remove original
+            os.remove(file_path)
         else:
-            # If extraction fails, upload the zip itself
             final_files = [file_path]
     else: 
         final_files = [file_path]
@@ -375,4 +373,4 @@ async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Ca
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
-    
+            
