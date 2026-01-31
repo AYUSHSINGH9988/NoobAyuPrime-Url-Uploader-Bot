@@ -9,32 +9,36 @@ import subprocess
 import shutil
 from urllib.parse import unquote
 from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiohttp import web
 
 # --- Environment Variables ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
-DUMP_ID = int(os.environ.get("DUMP_ID", 0)) # Dump Channel ID
+DUMP_ID = int(os.environ.get("DUMP_ID", 0))
 PORT = int(os.environ.get("PORT", 8080))
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- Initialize Aria2 (Torrent Engine) ---
-# Aria2c ko background mein start kar rahe hain
+# --- Initialize Aria2 ---
 subprocess.Popen(['aria2c', '--enable-rpc', '--rpc-listen-port=6800', '--daemon'])
-time.sleep(1) # Wait for start
+time.sleep(1)
 aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
+
+# --- Globals ---
+# Abort Flag Dictionary: {user_id: True}
+abort_dict = {}
 
 # --- Limits ---
 FREE_LIMIT = 300 * 1024 * 1024
-PREM_LIMIT = 1500 * 1024 * 1024 # 1.5GB for Premium
-YTDLP_LIMIT = 900 * 1024 * 1024 
+PREM_LIMIT = 1500 * 1024 * 1024
+YTDLP_LIMIT = 900 * 1024 * 1024
 
-# --- Web Server (For Render) ---
-from aiohttp import web
+# --- Web Server ---
 async def web_server():
-    async def handle(request): return web.Response(text="Ultimate Bot Running!")
+    async def handle(request): return web.Response(text="Bot Running with Cancel Feature!")
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -42,7 +46,7 @@ async def web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-# --- Helper Functions ---
+# --- Helper: Visuals ---
 def humanbytes(size):
     if not size: return ""
     power = 2**10
@@ -51,72 +55,129 @@ def humanbytes(size):
     while size > power: size /= power; n += 1
     return str(round(size, 2)) + " " + dic[n] + 'B'
 
-async def progress(current, total, message, start_time, action):
+def get_progress_bar_string(current, total):
+    percentage = current * 100 / total
+    filled_blocks = int(percentage // 10)
+    empty_blocks = 10 - filled_blocks
+    return '●' * filled_blocks + '○' * empty_blocks, percentage
+
+async def update_progress_ui(current, total, message, start_time, action):
     now = time.time()
     diff = now - start_time
-    if round(diff % 8.00) == 0 or current == total:
-        percentage = current * 100 / total
+    if round(diff % 5.00) == 0 or current == total:
+        bar, percentage = get_progress_bar_string(current, total)
         speed = current / diff if diff > 0 else 0
-        text = f"**{action}**\n`{humanbytes(current)}` / `{humanbytes(total)}`\nSpeed: `{humanbytes(speed)}/s`"
-        try: await message.edit_text(text)
+        text = f"**{action}**\n"
+        text += f"[{bar}] `{round(percentage, 2)}%`\n"
+        text += f"💾 `{humanbytes(current)}` / `{humanbytes(total)}`\n"
+        text += f"⚡ `{humanbytes(speed)}/s`"
+        
+        # Cancel Button
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="cancel_task")]])
+        
+        try: await message.edit_text(text, reply_markup=buttons)
         except: pass
 
-# --- 1. Hanime & Yt-dlp Downloader ---
-async def download_ytdlp(url, message):
+# --- 1. yt-dlp with Progress & Cancel ---
+async def download_ytdlp(url, message, user_id):
     loop = asyncio.get_event_loop()
+    start_time = time.time()
+    
+    # Progress Hook for yt-dlp
+    def ytdlp_progress_hook(d):
+        if user_id in abort_dict:
+            raise Exception("Cancelled by User")
+            
+        if d['status'] == 'downloading':
+            try:
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                downloaded = d.get('downloaded_bytes', 0)
+                if total > 0:
+                    # Thread-safe UI update
+                    future = asyncio.run_coroutine_threadsafe(
+                        update_progress_ui(downloaded, total, message, start_time, "📥 Downloading (yt-dlp)..."),
+                        loop
+                    )
+            except Exception as e:
+                pass
+
     def run_dl():
         ydl_opts = {
             'format': 'best',
             'outtmpl': '%(title)s.%(ext)s',
             'max_filesize': YTDLP_LIMIT,
             'quiet': True,
+            'progress_hooks': [ytdlp_progress_hook], # Attach hook
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return ydl.prepare_filename(info)
-    try:
-        await message.edit_text("📥 **Downloading via yt-dlp/Hanime...**")
-        return await loop.run_in_executor(None, run_dl)
-    except Exception as e:
-        print(e)
-        return None
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(info)
+        except Exception as e:
+            if "Cancelled by User" in str(e): return "CANCELLED"
+            return None
 
-# --- 2. Aria2c Torrent Downloader ---
-async def download_torrent(link, message):
+    return await loop.run_in_executor(None, run_dl)
+
+# --- 2. Aria2 with Cancel ---
+async def download_torrent(link, message, user_id):
     try:
         download = aria2.add_magnet(link)
-        prev_gid = download.gid
+        start_time = time.time()
         
         while True:
-            download = aria2.get_download(prev_gid)
+            # Check Cancel
+            if user_id in abort_dict:
+                aria2.remove([download])
+                return "CANCELLED"
+
+            download.update()
             if download.status == "complete":
-                return download.files[0].path # Return first file path
+                return download.files[0].path
             elif download.status == "error":
                 return None
             
-            # Progress update
             if download.total_length > 0:
-                await progress(download.completed_length, download.total_length, message, time.time(), "🧲 Leeching Torrent...")
+                await update_progress_ui(download.completed_length, download.total_length, message, start_time, "🧲 Leeching Torrent...")
             
             await asyncio.sleep(4)
-    except Exception as e:
-        print(e)
-        return None
+    except: return None
 
-# --- 3. Auto-Extraction Logic ---
-def extract_zip(file_path):
-    output_folder = "extracted_files"
-    if os.path.exists(output_folder): shutil.rmtree(output_folder)
-    os.makedirs(output_folder)
-    
-    # Using 7zip (p7zip-full) installed via Docker
-    subprocess.run(["7z", "x", file_path, f"-o{output_folder}"], stdout=subprocess.DEVNULL)
-    
-    files_list = []
-    for root, dirs, files in os.walk(output_folder):
-        for file in files:
-            files_list.append(os.path.join(root, file))
-    return files_list
+# --- 3. Direct Link with Cancel ---
+async def download_direct(url, message, user_id):
+    start_time = time.time()
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                file_name = url.split("/")[-1].split("?")[0]
+                if not "." in file_name: file_name += ".mp4"
+                
+                total_size = int(response.headers.get("content-length", 0))
+                downloaded = 0
+                
+                f = await aiofiles.open(file_name, mode='wb')
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    # Check Cancel
+                    if user_id in abort_dict:
+                        await f.close()
+                        os.remove(file_name)
+                        return "CANCELLED"
+                        
+                    await f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        await update_progress_ui(downloaded, total_size, message, start_time, "📥 Downloading...")
+                await f.close()
+                return file_name
+    return None
+
+# --- Callback Handler (Cancel Button) ---
+@app.on_callback_query(filters.regex("cancel_task"))
+async def cancel_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    abort_dict[user_id] = True # Set Flag
+    await callback_query.message.edit_text("❌ **Task Cancelled by User.**")
+    await callback_query.answer("Cancelled!")
 
 # --- Main Handler ---
 @app.on_message(filters.text & filters.private)
@@ -124,98 +185,49 @@ async def main_handler(client, message):
     url = message.text
     user_id = message.from_user.id
     
-    # Simple Admin Check (For full features)
-    is_premium = user_id == OWNER_ID 
-    limit = PREM_LIMIT if is_premium else FREE_LIMIT
+    # Reset Abort Flag
+    if user_id in abort_dict: del abort_dict[user_id]
 
-    msg = await message.reply_text("🔄 **Processing...**")
+    msg = await message.reply_text("🔄 **Initializing...**")
     file_path = None
-    is_zip = False
 
     try:
-        # A. Hanime / YouTube / Social
-        if "hanime.tv" in url or "youtube" in url or "youtu.be" in url:
-            file_path = await download_ytdlp(url, msg)
-        
-        # B. Torrent / Magnet
-        elif url.startswith("magnet:"):
-            file_path = await download_torrent(url, msg)
-            
-        # C. Direct Link (Existing Logic)
+        # Determine Downloader
+        if "magnet:" in url:
+            file_path = await download_torrent(url, msg, user_id)
+        elif any(x in url for x in ["youtube.com", "youtu.be", "hanime.tv", "instagram.com"]):
+            file_path = await download_ytdlp(url, msg, user_id)
         elif url.startswith("http"):
-            # (Shortened for brevity - reuse your old direct download code here or use aiohttp)
-            # For now, let's assume it's a direct link handled by aria2 as well!
-            # Aria2 handles HTTP links too beautifully.
-            try:
-                download = aria2.add_uris([url])
-                # Wait loop same as torrent...
-                while not download.is_complete:
-                    download.update()
-                    await asyncio.sleep(2)
-                    if download.status == 'error': raise Exception("DL Error")
-                    await progress(download.completed_length, download.total_length, msg, time.time(), "📥 Downloading...")
-                file_path = download.files[0].path
-            except:
-                await msg.edit_text("❌ Failed. Use Direct Link.")
+            file_path = await download_direct(url, msg, user_id)
+
+        # Check Result
+        if file_path == "CANCELLED":
+            return # Message already edited in callback
+
+        if file_path and os.path.exists(file_path):
+            # Check Cancel again before Upload
+            if user_id in abort_dict:
+                await msg.edit_text("❌ **Cancelled before Upload.**")
+                os.remove(file_path)
                 return
 
-        # --- Post Download Operations ---
-        if file_path and os.path.exists(file_path):
+            await msg.edit_text("📤 **Uploading...**")
+            sent_msg = await message.reply_document(
+                document=file_path,
+                caption=f"🎥 `{os.path.basename(file_path)}`",
+                progress=update_progress_ui,
+                progress_args=(msg, time.time(), "📤 Uploading...")
+            )
             
-            # 1. Extraction Check
-            if file_path.endswith(".zip") or file_path.endswith(".rar"):
-                await msg.edit_text("📦 **Extracting Archive...**")
-                extracted_files = extract_zip(file_path)
-                
-                if not extracted_files:
-                    await msg.edit_text("❌ Archive was empty or password protected.")
-                    return
+            # Dump Logic
+            if DUMP_ID != 0:
+                try: await sent_msg.copy(DUMP_ID)
+                except: pass
 
-                await msg.edit_text(f"✅ Extracted {len(extracted_files)} files. Uploading...")
-                
-                for f in extracted_files:
-                    # Size Check
-                    if os.path.getsize(f) > limit: continue 
-                    
-                    # Upload Extracted File
-                    sent_msg = await message.reply_document(document=f, caption=f"📄 `{os.path.basename(f)}`")
-                    
-                    # Dump
-                    if DUMP_ID != 0:
-                        await sent_msg.copy(DUMP_ID)
-                    
-                    os.remove(f)
-                    await asyncio.sleep(2) # Floodwait prevention
-                
-                await msg.delete()
-                
-            else:
-                # 2. Normal Upload
-                await msg.edit_text("📤 **Uploading...**")
-                sent_msg = await message.reply_document(
-                    document=file_path,
-                    caption=f"🎥 `{os.path.basename(file_path)}`",
-                    progress=progress,
-                    progress_args=(msg, time.time(), "📤 Uploading...")
-                )
-                
-                # 3. Dump Logic
-                if DUMP_ID != 0:
-                    try:
-                        await sent_msg.copy(DUMP_ID)
-                        await client.send_message(DUMP_ID, f"User: {message.from_user.mention}\nSource: {url}")
-                    except Exception as e:
-                        print(f"Dump Error: {e}")
-
-                await msg.delete()
-
-            # Cleanup
-            if os.path.exists(file_path): os.remove(file_path)
-            # Clean aria2 downloads
-            aria2.purge()
-            
+            await msg.delete()
+            os.remove(file_path)
         else:
-            await msg.edit_text("❌ Download Failed!")
+            await msg.edit_text("❌ Download Failed! (Link Error or File too big)")
 
     except Exception as e:
         await msg.edit_text(f"⚠️ Error: {str(e)}")
@@ -224,4 +236,6 @@ if __name__ == "__main__":
     app.start()
     app.loop.run_until_complete(web_server())
     app.loop.run_forever()
-      
+    
+            
+            
