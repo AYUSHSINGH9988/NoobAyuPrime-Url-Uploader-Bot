@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import asyncio
 import aiohttp
 import aiofiles
@@ -10,48 +9,62 @@ import subprocess
 import shutil
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- Environment Variables ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+MONGO_URL = os.environ.get("MONGO_URL") # New Variable
 PORT = int(os.environ.get("PORT", 8080))
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# --- MongoDB Setup ---
+if not MONGO_URL:
+    print("❌ MONGO_URL Missing! Bot will not save data permanently.")
+    mongo_db = None
+else:
+    mongo_client = AsyncIOMotorClient(MONGO_URL)
+    mongo_db = mongo_client["URL_Uploader_Bot"]
+    config_col = mongo_db["config"]
 
 # --- Initialize Aria2 ---
 subprocess.Popen(['aria2c', '--enable-rpc', '--rpc-listen-port=6800', '--daemon'])
 time.sleep(1)
 aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
 
-# --- Globals & Storage ---
+# --- Globals ---
 abort_dict = {}
 YTDLP_LIMIT = 1500 * 1024 * 1024
-CONFIG_FILE = "config.json"
-config = {"auth_users": [], "dump_id": 0}
 
-# --- Load/Save Config ---
-def load_config():
-    global config
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
-        except: pass
+# --- Database Functions ---
+async def get_config():
+    if not mongo_db: return {"auth_users": [], "dump_id": 0}
+    data = await config_col.find_one({"_id": "bot_settings"})
+    if not data:
+        # Create default if not exists
+        await config_col.insert_one({"_id": "bot_settings", "auth_users": [], "dump_id": 0})
+        return {"auth_users": [], "dump_id": 0}
+    return data
 
-def save_config():
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f)
-    except: pass
+async def add_auth_user(user_id):
+    if mongo_db:
+        await config_col.update_one({"_id": "bot_settings"}, {"$addToSet": {"auth_users": user_id}}, upsert=True)
 
-load_config()
+async def remove_auth_user(user_id):
+    if mongo_db:
+        await config_col.update_one({"_id": "bot_settings"}, {"$pull": {"auth_users": user_id}})
+
+async def set_dump_id(chat_id):
+    if mongo_db:
+        await config_col.update_one({"_id": "bot_settings"}, {"$set": {"dump_id": chat_id}}, upsert=True)
 
 # --- Web Server ---
 from aiohttp import web
 async def web_server():
-    async def handle(request): return web.Response(text="Bot is Running!")
+    async def handle(request): return web.Response(text="Bot Running with MongoDB!")
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -84,15 +97,7 @@ async def take_screenshot(video_path):
     except: pass
     return None
 
-async def get_duration(video_path):
-    try:
-        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await process.communicate()
-        return int(float(stdout.decode().strip()))
-    except: return 0
-
-# --- ☁️ CLOUD UI PROGRESS (Updated with Credit) ☁️ ---
+# --- UI PROGRESS ---
 async def update_progress_ui(current, total, message, start_time, action):
     now = time.time()
     diff = now - start_time
@@ -105,7 +110,6 @@ async def update_progress_ui(current, total, message, start_time, action):
         filled = int(percentage // 10)
         bar = '☁️' * filled + '◌' * (10 - filled)
         
-        # Added Powered by link at the top
         text = f"⚡ [Powered by Ayuprime](tg://user?id=8428298917)\n\n"
         text += f"**{action}**\n\n"
         text += f"{bar}  `{round(percentage, 1)}%`\n\n"
@@ -117,7 +121,7 @@ async def update_progress_ui(current, total, message, start_time, action):
         try: await message.edit_text(text, reply_markup=buttons)
         except: pass
 
-# --- Extraction & File Logic ---
+# --- File Logic ---
 def extract_archive(file_path):
     output_dir = f"extracted_{int(time.time())}"
     if not os.path.exists(output_dir): os.makedirs(output_dir)
@@ -134,8 +138,8 @@ def get_files_from_folder(folder_path):
         for file in files: files_list.append(os.path.join(root, file))
     return files_list
 
-# --- Smart Upload Helper ---
-async def upload_file(client, message, file_path, user_mention):
+# --- Upload Helper ---
+async def upload_file(client, message, file_path, user_mention, dump_id):
     try:
         file_name = os.path.basename(file_path)
         thumb_path = None
@@ -150,8 +154,8 @@ async def upload_file(client, message, file_path, user_mention):
             progress_args=(message, time.time(), "☁️ Uploading...")
         )
         
-        if config["dump_id"] != 0:
-            try: await sent_msg.copy(config["dump_id"])
+        if dump_id != 0:
+            try: await sent_msg.copy(dump_id)
             except Exception as e: await message.reply_text(f"⚠️ **Dump Failed:** {e}")
             
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
@@ -163,7 +167,7 @@ async def upload_file(client, message, file_path, user_mention):
 # --- Download Logic ---
 async def download_logic(url, message, user_id, mode):
     if "pixeldrain.com/u/" in url:
-        try: url = f"https://pixeldrain.com/api/file/{url.split('pixeldrain.com/u/')[1].split('/')[0]}"
+        try: url = f"https://pixeldrain.com/api/file/{url.split('pixeldrain.com/u/")[1].split("/")[0]}"
         except: pass
     try:
         file_path = None
@@ -225,14 +229,19 @@ async def download_logic(url, message, user_id, mode):
 # --- Main Processor ---
 async def process_task(client, message, url, mode="auto"):
     user_id = message.from_user.id
-    if user_id != OWNER_ID and user_id not in config["auth_users"]:
+    config = await get_config() # MongoDB Fetch
+    
+    if user_id != OWNER_ID and user_id not in config.get("auth_users", []):
         await message.reply_text("⛔ **Unauthorized!** Ask Owner.")
         return
     if user_id in abort_dict: del abort_dict[user_id]
+    
     msg = await message.reply_text("☁️ **Connecting to Cloud...**")
     file_path = await download_logic(url, msg, user_id, mode)
+    
     if file_path == "CANCELLED": await msg.edit_text("❌ Cancelled."); return
     if not file_path or not os.path.exists(file_path): await msg.edit_text("❌ Download Failed."); return
+    
     final_files = []; temp_dir = None; is_extracted = False
     if os.path.isdir(file_path):
         await msg.edit_text("📂 **Processing Folder...**")
@@ -243,11 +252,14 @@ async def process_task(client, message, url, mode="auto"):
         if extracted_list: final_files = extracted_list; is_extracted = True; os.remove(file_path)
         else: final_files = [file_path]
     else: final_files = [file_path]
+    
     if not final_files: await msg.edit_text("❌ No files found."); return
     await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
+    
+    dump_id = config.get("dump_id", 0)
     for f in final_files:
         if os.path.getsize(f) < 1024*10: continue
-        await upload_file(client, msg, f, message.from_user.mention)
+        await upload_file(client, msg, f, message.from_user.mention, dump_id)
         if is_extracted or os.path.isdir(file_path): 
             try: os.remove(f)
             except: pass
@@ -258,38 +270,32 @@ async def process_task(client, message, url, mode="auto"):
     aria2.purge()
 
 # --- Commands ---
-# NEW START COMMAND WITH PHOTO
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
-    # Make sure 'start_img.jpg' is uploaded to your GitHub repo root!
     photo_path = "start_img.jpg" 
     caption = """
 **👋 Welcome to URL Uploader Bot!**
 ⚡ [Powered by Ayuprime](tg://user?id=8428298917)
 
 **🌟 Features:**
-☁️ **Cloud Uploader:** Direct links & PixelDrain.
+☁️ **MongoDB Connected:** Data is now PERMANENT!
 ⚡ **Torrent Leech:** Magnets & .torrent files supported.
 📹 **Video Downloader:** YouTube, Instagram, Hanime, etc.
-📦 **Auto-Extract:** Unzips ZIP/RAR/7Z archives automatically.
-🖼️ **Smart Metadata:** Adds thumbnails & duration to videos.
-🔒 **Private Mode:** Authorized users only.
-📝 **Dump Channel:** Backs up files to channel (Owner only).
+📦 **Auto-Extract:** Unzips ZIP/RAR/7Z archives.
+🔒 **Private Mode:** Access Control System.
+📝 **Dump Channel:** Auto-Backup supported.
 
 *Send any link to start!*
     """
-    try:
-        await m.reply_photo(photo=photo_path, caption=caption)
-    except Exception as e:
-        # Fallback if photo is not found in repo
-        await m.reply_text(caption.replace("**👋 Welcome", "⚠️ (Photo missing in repo)\n\n**👋 Welcome"))
+    try: await m.reply_photo(photo=photo_path, caption=caption)
+    except: await m.reply_text(caption)
 
 @app.on_message(filters.command("setchatid") & filters.user(OWNER_ID))
 async def set_dump(c, m):
     try:
         chat_id = int(m.command[1])
-        config["dump_id"] = chat_id; save_config()
-        try: await c.send_message(chat_id, "✅ **Dump Connected!**"); await m.reply_text(f"✅ Dump Set: `{chat_id}`")
+        await set_dump_id(chat_id)
+        try: await c.send_message(chat_id, "✅ **Dump Connected via MongoDB!**"); await m.reply_text(f"✅ Dump Set: `{chat_id}`")
         except Exception as e: await m.reply_text(f"⚠️ ID Set, but Bot can't send msg.\nError: `{e}`")
     except: await m.reply_text("Usage: `/setchatid -100xxxxxxx`")
 
@@ -297,15 +303,32 @@ async def set_dump(c, m):
 async def auth(c, m):
     try:
         uid = int(m.command[1])
-        if uid not in config["auth_users"]: config["auth_users"].append(uid); save_config(); await m.reply_text(f"✅ Authorized: `{uid}`")
-    except: pass
+        await add_auth_user(uid)
+        await m.reply_text(f"✅ Authorized (Saved to DB): `{uid}`")
+    except: await m.reply_text("Usage: `/auth user_id`")
 
 @app.on_message(filters.command("unauth") & filters.user(OWNER_ID))
 async def unauth(c, m):
     try:
         uid = int(m.command[1])
-        if uid in config["auth_users"]: config["auth_users"].remove(uid); save_config(); await m.reply_text(f"🚫 Removed: `{uid}`")
-    except: pass
+        await remove_auth_user(uid)
+        await m.reply_text(f"🚫 Removed (from DB): `{uid}`")
+    except: await m.reply_text("Usage: `/unauth user_id`")
+
+@app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
+async def broadcast_msg(c, m):
+    if not m.reply_to_message: await m.reply_text("Reply to a message to broadcast."); return
+    config = await get_config()
+    users = config.get("auth_users", [])
+    sent = 0
+    await m.reply_text(f"📢 Broadcasting to {len(users)} users...")
+    for uid in users:
+        try:
+            await m.reply_to_message.copy(uid)
+            sent += 1
+            await asyncio.sleep(1) # Prevent flood
+        except: pass
+    await m.reply_text(f"✅ Broadcast complete. Sent to {sent} users.")
 
 @app.on_message(filters.command("leech"))
 async def leech_cmd(c, m): 
@@ -327,4 +350,3 @@ async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Ca
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
-  
