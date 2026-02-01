@@ -32,17 +32,17 @@ else:
     config_col = mongo_db["config"]
     users_col = mongo_db["users"]
 
-# --- Initialize Aria2 (FIXED: Added seed-time=0) ---
+# --- Initialize Aria2 (Seed Time 0) ---
 try:
     cmd = [
         'aria2c',
         '--enable-rpc',
         '--rpc-listen-port=6800',
         '--daemon',
-        '--seed-time=0',          # Stop seeding immediately
+        '--seed-time=0',
         '--max-connection-per-server=10',
         '--min-split-size=10M',
-        '--follow-torrent=mem',   # Auto-resolve magnets
+        '--follow-torrent=mem',
         '--allow-overwrite=true'
     ]
     subprocess.Popen(cmd)
@@ -135,6 +135,8 @@ def get_files_from_folder(folder_path):
 # --- Upload Helper ---
 async def upload_file(client, message, file_path, user_mention):
     try:
+        # FIX: Ensure file_path is string
+        file_path = str(file_path)
         file_name = os.path.basename(file_path)
         thumb_path = None
         is_video = file_name.lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv'))
@@ -195,8 +197,9 @@ async def download_logic(url, message, user_id, mode):
                 
                 # FIX: Check if complete OR 100% done
                 if download.status == "complete" or (download.total_length > 0 and download.completed_length == download.total_length):
-                    file_path = download.files[0].path
-                    # Ensure path exists before breaking
+                    # CRITICAL FIX: Convert PosixPath to String
+                    file_path = str(download.files[0].path)
+                    
                     if os.path.exists(file_path):
                         await asyncio.sleep(2)
                         break
@@ -240,7 +243,7 @@ async def download_logic(url, message, user_id, mode):
                             dl_size += len(chunk)
                             await update_progress_ui(dl_size, total, message, start_time, "☁️ Downloading...", None)
                         await f.close()
-        return file_path
+        return str(file_path) if file_path else None
     except Exception as e: return f"ERROR: {str(e)}"
 
 # --- Main Processor ---
@@ -265,6 +268,8 @@ async def process_task(client, message, url, mode="auto"):
         if file_path == "CANCELLED": await msg.edit_text("❌ Cancelled."); return
         if not file_path or not os.path.exists(file_path): await msg.edit_text("❌ Download Failed."); return
         
+        # Force convert to string to prevent PosixPath errors
+        file_path = str(file_path)
         final_files = []; temp_dir = None; is_extracted = False
         
         if os.path.isdir(file_path):
@@ -285,6 +290,7 @@ async def process_task(client, message, url, mode="auto"):
         await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
         
         for f in final_files:
+            f = str(f) # Ensure string
             if os.path.getsize(f) < 1024*10: continue
             await upload_file(client, msg, f, message.from_user.mention)
             if is_extracted or os.path.isdir(file_path): 
@@ -341,4 +347,6 @@ async def web_server():
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
+    
+        
         
