@@ -32,9 +32,20 @@ else:
     config_col = mongo_db["config"]
     users_col = mongo_db["users"]
 
-# --- Initialize Aria2 ---
+# --- Initialize Aria2 (FIXED: Added seed-time=0) ---
 try:
-    subprocess.Popen(['aria2c', '--enable-rpc', '--rpc-listen-port=6800', '--daemon'])
+    cmd = [
+        'aria2c',
+        '--enable-rpc',
+        '--rpc-listen-port=6800',
+        '--daemon',
+        '--seed-time=0',          # Stop seeding immediately
+        '--max-connection-per-server=10',
+        '--min-split-size=10M',
+        '--follow-torrent=mem',   # Auto-resolve magnets
+        '--allow-overwrite=true'
+    ]
+    subprocess.Popen(cmd)
     time.sleep(1)
     aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
 except Exception as e:
@@ -43,7 +54,7 @@ except Exception as e:
 # --- Globals ---
 abort_dict = {}
 processing_ids = []
-YTDLP_LIMIT = 2000 * 1024 * 1024 # 2GB Limit
+YTDLP_LIMIT = 2000 * 1024 * 1024
 
 # --- Helper Functions ---
 def humanbytes(size):
@@ -156,14 +167,20 @@ async def download_logic(url, message, user_id, mode):
         if mode == "leech" or url.startswith("magnet:") or url.lower().endswith(".torrent"):
             download = None
             if url.startswith("http"):
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(url) as res:
-                        if res.status == 200:
-                            data = await res.read()
-                            meta = f"meta_{user_id}.torrent"
-                            with open(meta, "wb") as f: f.write(data)
-                            download = aria2.add_torrent(meta)
-            else: download = aria2.add_magnet(url)
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(url) as res:
+                            if res.status == 200:
+                                data = await res.read()
+                                meta = f"meta_{user_id}.torrent"
+                                with open(meta, "wb") as f: f.write(data)
+                                try: download = aria2.add_torrent(meta)
+                                except: return f"ERROR: Invalid Torrent File (Try Magnet)."
+                            else: return f"ERROR: Link returned status {res.status}"
+                except Exception as e: return f"ERROR: Fetch failed {e}"
+            else:
+                try: download = aria2.add_magnet(url)
+                except: return f"ERROR: Invalid Magnet Link."
             
             if not download: return "ERROR: Failed to add torrent."
             
@@ -171,29 +188,34 @@ async def download_logic(url, message, user_id, mode):
             while True:
                 if user_id in abort_dict: aria2.remove([download]); return "CANCELLED"
                 download.update()
-                if download.status == "error": return "ERROR: Aria2 Error (Dead link/Full Storage)."
-                if download.status == "complete": 
-                    file_path = download.files[0].path; await asyncio.sleep(2); break
+                
+                # Check for errors
+                if download.status == "error": 
+                    return "ERROR: Aria2 Error (Dead link or Storage full)."
+                
+                # FIX: Check if complete OR 100% done
+                if download.status == "complete" or (download.total_length > 0 and download.completed_length == download.total_length):
+                    file_path = download.files[0].path
+                    # Ensure path exists before breaking
+                    if os.path.exists(file_path):
+                        await asyncio.sleep(2)
+                        break
+                
                 if download.total_length > 0:
                      await update_progress_ui(download.completed_length, download.total_length, message, start_time, "☁️ Leeching...", download)
                 await asyncio.sleep(4)
 
-        # 2. yt-dlp (UPDATED FOR HANIME)
+        # 2. yt-dlp
         elif mode == "ytdl" or any(x in url for x in ["youtube", "youtu.be", "hanime", "instagram"]):
              loop = asyncio.get_event_loop()
              def run():
-                 # Adding Browser Headers to fix "Unsupported URL"
                  opts = {
                      'format': 'best',
                      'outtmpl': '%(title)s.%(ext)s',
                      'max_filesize': YTDLP_LIMIT,
                      'quiet': True,
                      'nocheckcertificate': True,
-                     'http_headers': {
-                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                         'Accept-Language': 'en-us,en;q=0.5'
-                     }
+                     'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
                  }
                  with yt_dlp.YoutubeDL(opts) as ydl:
                      info = ydl.extract_info(url, download=True)
@@ -224,11 +246,10 @@ async def download_logic(url, message, user_id, mode):
 # --- Main Processor ---
 async def process_task(client, message, url, mode="auto"):
     user_id = message.from_user.id
-    if message.id in processing_ids: return # Anti-Dup
+    if message.id in processing_ids: return
     processing_ids.append(message.id)
 
     try:
-        # Auto-Save User (MongoDB)
         if mongo_db is not None:
              await users_col.update_one({"_id": user_id}, {"$set": {"active": True}}, upsert=True)
 
