@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import asyncio
 import aiohttp
 import aiofiles
@@ -10,15 +9,27 @@ import subprocess
 import shutil
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- Environment Variables ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+MONGO_URL = os.environ.get("MONGO_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# --- MongoDB Setup ---
+if not MONGO_URL:
+    print("❌ MONGO_URL Missing! Data will not be saved permanently.")
+    mongo_db = None
+else:
+    mongo_client = AsyncIOMotorClient(MONGO_URL)
+    mongo_db = mongo_client["URL_Uploader_Bot"]
+    config_col = mongo_db["config"]
+    users_col = mongo_db["users"]
 
 # --- Initialize Aria2 ---
 subprocess.Popen(['aria2c', '--enable-rpc', '--rpc-listen-port=6800', '--daemon'])
@@ -27,31 +38,35 @@ aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
 
 # --- Globals ---
 abort_dict = {}
+processing_ids = []  # To prevent double downloads
 YTDLP_LIMIT = 1500 * 1024 * 1024
-CONFIG_FILE = "config.json"
-config = {"dump_id": 0}
 
-# --- Simple Config (JSON) ---
-def load_config():
-    global config
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
-        except: pass
+# --- Database Functions ---
+async def get_dump_id():
+    if mongo_db is None: return 0
+    data = await config_col.find_one({"_id": "dump_settings"})
+    if not data: return 0
+    return data.get("chat_id", 0)
 
-def save_config():
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f)
-    except: pass
+async def set_dump_id(chat_id):
+    if mongo_db is not None:
+        await config_col.update_one({"_id": "dump_settings"}, {"$set": {"chat_id": chat_id}}, upsert=True)
 
-load_config()
+async def add_user_to_db(user_id):
+    if mongo_db is not None:
+        await users_col.update_one({"_id": user_id}, {"$set": {"active": True}}, upsert=True)
+
+async def get_all_users():
+    if mongo_db is None: return []
+    users = []
+    async for doc in users_col.find():
+        users.append(doc["_id"])
+    return users
 
 # --- Web Server ---
 from aiohttp import web
 async def web_server():
-    async def handle(request): return web.Response(text="Bot Running (Owner Only)!")
+    async def handle(request): return web.Response(text="Bot Running (Anti-Dup Enabled)!")
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -73,7 +88,7 @@ def time_formatter(seconds: int) -> str:
     hours, minutes = divmod(minutes, 60)
     return "{:02d}:{:02d}:{:02d}".format(int(hours), int(minutes), int(seconds))
 
-# --- Thumbnail ---
+# --- Thumbnail & Duration ---
 async def take_screenshot(video_path):
     try:
         thumb_path = f"{video_path}.jpg"
@@ -84,7 +99,7 @@ async def take_screenshot(video_path):
     except: pass
     return None
 
-# --- UI Progress ---
+# --- UI PROGRESS ---
 async def update_progress_ui(current, total, message, start_time, action):
     now = time.time()
     diff = now - start_time
@@ -126,7 +141,7 @@ def get_files_from_folder(folder_path):
     return files_list
 
 # --- Upload Helper ---
-async def upload_file(client, message, file_path, user_mention):
+async def upload_file(client, message, file_path, user_mention, dump_id):
     try:
         file_name = os.path.basename(file_path)
         thumb_path = None
@@ -141,8 +156,8 @@ async def upload_file(client, message, file_path, user_mention):
             progress_args=(message, time.time(), "☁️ Uploading...")
         )
         
-        if config["dump_id"] != 0:
-            try: await sent_msg.copy(config["dump_id"])
+        if dump_id != 0:
+            try: await sent_msg.copy(dump_id)
             except Exception as e: await message.reply_text(f"⚠️ **Dump Failed:** {e}")
             
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
@@ -156,7 +171,6 @@ async def download_logic(url, message, user_id, mode):
     if "pixeldrain.com/u/" in url:
         try: url = f"https://pixeldrain.com/api/file/{url.split('pixeldrain.com/u/')[1].split('/')[0]}"
         except: pass
-
     try:
         file_path = None
         if mode == "leech" or url.startswith("magnet:") or url.lower().endswith(".torrent"):
@@ -170,7 +184,6 @@ async def download_logic(url, message, user_id, mode):
                             with open(meta, "wb") as f: f.write(data)
                             download = aria2.add_torrent(meta)
             else: download = aria2.add_magnet(url)
-            
             if not download: return None
             start_time = time.time()
             while True:
@@ -178,9 +191,7 @@ async def download_logic(url, message, user_id, mode):
                 download.update()
                 if download.status == "error": return None
                 if download.status == "complete": 
-                    file_path = download.files[0].path
-                    await asyncio.sleep(2)
-                    break
+                    file_path = download.files[0].path; await asyncio.sleep(2); break
                 if download.total_length > 0:
                      await update_progress_ui(download.completed_length, download.total_length, message, start_time, "☁️ Leeching...")
                 await asyncio.sleep(4)
@@ -222,67 +233,69 @@ async def download_logic(url, message, user_id, mode):
 async def process_task(client, message, url, mode="auto"):
     user_id = message.from_user.id
     
-    # OWNER ONLY CHECK
-    if user_id != OWNER_ID:
-        return # Ignore everyone else
+    # --- ANTI-DUPLICATE CHECK ---
+    if message.id in processing_ids:
+        return # Ignore duplicate request
+    processing_ids.append(message.id)
+    # ----------------------------
 
-    if user_id in abort_dict: del abort_dict[user_id]
-    
-    msg = await message.reply_text("☁️ **Connecting to Cloud...**")
-    file_path = await download_logic(url, msg, user_id, mode)
-    
-    if file_path == "CANCELLED": await msg.edit_text("❌ Cancelled."); return
-    if not file_path or not os.path.exists(file_path): await msg.edit_text("❌ Download Failed."); return
-    
-    final_files = []; temp_dir = None; is_extracted = False
-    
-    if os.path.isdir(file_path):
-        await msg.edit_text("📂 **Processing Folder...**")
-        final_files = get_files_from_folder(file_path)
-    
-    elif file_path.lower().endswith((".zip", ".rar", ".7z", ".tar")):
-        await msg.edit_text("📦 **Extracting Archive...**")
-        extracted_list, temp_dir = extract_archive(file_path)
-        if extracted_list: 
-            final_files = extracted_list
-            is_extracted = True
-            os.remove(file_path)
-        else:
-            final_files = [file_path]
-    else: 
-        final_files = [file_path]
-    
-    if not final_files: await msg.edit_text("❌ No files found."); return
-    
-    await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
-    
-    for f in final_files:
-        if os.path.getsize(f) < 1024*10: continue
-        await upload_file(client, msg, f, message.from_user.mention)
-        if is_extracted or os.path.isdir(file_path): 
-            try: os.remove(f)
-            except: pass
-            
-    await msg.delete()
-    if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    if os.path.isdir(file_path): shutil.rmtree(file_path)
-    elif os.path.exists(file_path): os.remove(file_path)
-    aria2.purge()
+    try:
+        await add_user_to_db(user_id)
+        if user_id in abort_dict: del abort_dict[user_id]
+        
+        msg = await message.reply_text("☁️ **Connecting to Cloud...**")
+        file_path = await download_logic(url, msg, user_id, mode)
+        
+        if file_path == "CANCELLED": await msg.edit_text("❌ Cancelled."); return
+        if not file_path or not os.path.exists(file_path): await msg.edit_text("❌ Download Failed."); return
+        
+        final_files = []; temp_dir = None; is_extracted = False
+        if os.path.isdir(file_path):
+            await msg.edit_text("📂 **Processing Folder...**")
+            final_files = get_files_from_folder(file_path)
+        elif file_path.lower().endswith((".zip", ".rar", ".7z", ".tar")):
+            await msg.edit_text("📦 **Extracting Archive...**")
+            extracted_list, temp_dir = extract_archive(file_path)
+            if extracted_list: final_files = extracted_list; is_extracted = True; os.remove(file_path)
+            else: final_files = [file_path]
+        else: final_files = [file_path]
+        
+        if not final_files: await msg.edit_text("❌ No files found."); return
+        await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
+        
+        dump_id = await get_dump_id()
+        for f in final_files:
+            if os.path.getsize(f) < 1024*10: continue
+            await upload_file(client, msg, f, message.from_user.mention, dump_id)
+            if is_extracted or os.path.isdir(file_path): 
+                try: os.remove(f)
+                except: pass
+        await msg.delete()
+        if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+        if os.path.isdir(file_path): shutil.rmtree(file_path)
+        elif os.path.exists(file_path): os.remove(file_path)
+        aria2.purge()
+        
+    finally:
+        # Cleanup ID from processing list
+        if message.id in processing_ids:
+            processing_ids.remove(message.id)
 
 # --- Commands ---
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
+    await add_user_to_db(m.from_user.id)
     photo_path = "start_img.jpg" 
     caption = """
 **👋 Welcome to URL Uploader Bot!**
 ⚡ [Powered by Ayuprime](tg://user?id=8428298917)
 
-**🌟 Features:**
-☁️ **Cloud UI:** Fast Uploads.
-⚡ **Torrent Leech:** Magnets & .torrent support.
-📹 **Video Downloader:** YT, Insta, Hanime.
-📦 **Auto-Extract:** Unzip Archives.
-🔒 **Owner Only:** Secure & Private.
+**🌟 Advanced Features:**
+☁️ **MongoDB:** Permanent Data.
+📢 **Broadcast:** Send messages to all users.
+⚡ **Torrent & Direct:** High speed leeching.
+📹 **Video Downloader:** YouTube, Hanime, etc.
+📝 **Dump Backup:** Auto-save files to channel.
 
 *Send any link to start!*
     """
@@ -293,17 +306,30 @@ async def start_cmd(c, m):
 async def set_dump(c, m):
     try:
         chat_id = int(m.command[1])
-        config["dump_id"] = chat_id
-        save_config()
-        await m.reply_text(f"✅ Dump Set: `{chat_id}`")
+        await set_dump_id(chat_id)
+        try: await c.send_message(chat_id, "✅ **Dump Connected via MongoDB!**"); await m.reply_text(f"✅ Dump Set: `{chat_id}`")
+        except Exception as e: await m.reply_text(f"⚠️ ID Set, but Bot can't send msg.\nError: `{e}`")
     except: await m.reply_text("Usage: `/setchatid -100xxxxxxx`")
 
-@app.on_message(filters.command("leech") & filters.user(OWNER_ID))
+@app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
+async def broadcast_msg(c, m):
+    if not m.reply_to_message: await m.reply_text("Reply to a message to broadcast."); return
+    users = await get_all_users()
+    if not users: await m.reply_text("No users found."); return
+    msg = await m.reply_text(f"📢 Broadcasting to {len(users)} users...")
+    sent = 0; failed = 0
+    for uid in users:
+        try:
+            await m.reply_to_message.copy(uid); sent += 1; await asyncio.sleep(0.5)
+        except: failed += 1
+    await msg.edit_text(f"✅ **Broadcast Done**\nSent: `{sent}`\nFailed: `{failed}`")
+
+@app.on_message(filters.command("leech"))
 async def leech_cmd(c, m): 
     link = m.text.split(None, 1)[1] if len(m.command)>1 else (m.reply_to_message.text if m.reply_to_message else "")
     if link: await process_task(c, m, link, "leech")
 
-@app.on_message(filters.command("ytdl") & filters.user(OWNER_ID))
+@app.on_message(filters.command("ytdl"))
 async def ytdl_cmd(c, m):
     link = m.text.split(None, 1)[1] if len(m.command)>1 else (m.reply_to_message.text if m.reply_to_message else "")
     if link: await process_task(c, m, link, "ytdl")
@@ -318,5 +344,4 @@ async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Ca
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
-
- 
+    
