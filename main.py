@@ -18,6 +18,8 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 MONGO_URL = os.environ.get("MONGO_URL")
+# Example: "MyDrive:Downloads" (Name from rclone.conf : Folder Path)
+RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:") 
 PORT = int(os.environ.get("PORT", 8080))
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -32,7 +34,7 @@ else:
     config_col = mongo_db["config"]
     users_col = mongo_db["users"]
 
-# --- Initialize Aria2 (Seed Time 0) ---
+# --- Initialize Aria2 ---
 try:
     cmd = [
         'aria2c',
@@ -132,10 +134,43 @@ def get_files_from_folder(folder_path):
         for file in files: files_list.append(os.path.join(root, file))
     return files_list
 
-# --- Upload Helper ---
+# --- Rclone Upload ---
+async def rclone_upload_file(message, file_path):
+    file_name = os.path.basename(file_path)
+    # Use config from repo or default location
+    config_path = "rclone.conf" 
+    
+    if not os.path.exists(config_path):
+         await message.edit_text("❌ `rclone.conf` not found in bot root!")
+         return False
+
+    cmd = [
+        "rclone", "copy", file_path, RCLONE_PATH,
+        "--config", config_path,
+        "--progress"
+    ]
+    
+    await message.edit_text(f"🚀 **Rclone Uploading:** `{file_name}`\nTarget: `{RCLONE_PATH}`")
+    
+    process = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    
+    # Rclone doesn't give easy progress parsing in python without complex regex
+    # So we just wait for it to finish
+    await process.wait()
+    
+    if process.returncode == 0:
+        await message.edit_text(f"✅ **Rclone Uploaded!**\nFile: `{file_name}`")
+        return True
+    else:
+        stderr = await process.stderr.read()
+        await message.edit_text(f"❌ **Rclone Failed:**\n`{stderr.decode()}`")
+        return False
+
+# --- Telegram Upload Helper ---
 async def upload_file(client, message, file_path, user_mention):
     try:
-        # FIX: Ensure file_path is string
         file_path = str(file_path)
         file_name = os.path.basename(file_path)
         thumb_path = None
@@ -157,7 +192,6 @@ async def upload_file(client, message, file_path, user_mention):
 
 # --- Download Logic ---
 async def download_logic(url, message, user_id, mode):
-    # Pixeldrain Fix
     if "pixeldrain.com/u/" in url:
         try: url = f"https://pixeldrain.com/api/file/{url.split('pixeldrain.com/u/')[1].split('/')[0]}"
         except: pass
@@ -191,15 +225,10 @@ async def download_logic(url, message, user_id, mode):
                 if user_id in abort_dict: aria2.remove([download]); return "CANCELLED"
                 download.update()
                 
-                # Check for errors
-                if download.status == "error": 
-                    return "ERROR: Aria2 Error (Dead link or Storage full)."
+                if download.status == "error": return "ERROR: Aria2 Error (Dead link/Full Storage)."
                 
-                # FIX: Check if complete OR 100% done
                 if download.status == "complete" or (download.total_length > 0 and download.completed_length == download.total_length):
-                    # CRITICAL FIX: Convert PosixPath to String
                     file_path = str(download.files[0].path)
-                    
                     if os.path.exists(file_path):
                         await asyncio.sleep(2)
                         break
@@ -247,7 +276,7 @@ async def download_logic(url, message, user_id, mode):
     except Exception as e: return f"ERROR: {str(e)}"
 
 # --- Main Processor ---
-async def process_task(client, message, url, mode="auto"):
+async def process_task(client, message, url, mode="auto", upload_target="tg"):
     user_id = message.from_user.id
     if message.id in processing_ids: return
     processing_ids.append(message.id)
@@ -268,7 +297,6 @@ async def process_task(client, message, url, mode="auto"):
         if file_path == "CANCELLED": await msg.edit_text("❌ Cancelled."); return
         if not file_path or not os.path.exists(file_path): await msg.edit_text("❌ Download Failed."); return
         
-        # Force convert to string to prevent PosixPath errors
         file_path = str(file_path)
         final_files = []; temp_dir = None; is_extracted = False
         
@@ -287,20 +315,29 @@ async def process_task(client, message, url, mode="auto"):
         
         if not final_files: await msg.edit_text("❌ No files found."); return
         
-        await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
+        # --- UPLOAD PHASE ---
+        if upload_target == "rclone":
+            await msg.edit_text(f"🚀 **Starting Rclone Upload ({len(final_files)} files)...**")
+            for f in final_files:
+                await rclone_upload_file(msg, f)
+        else:
+            await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files to Telegram...**")
+            for f in final_files:
+                if os.path.getsize(f) < 1024*10: continue
+                await upload_file(client, msg, f, message.from_user.mention)
         
-        for f in final_files:
-            f = str(f) # Ensure string
-            if os.path.getsize(f) < 1024*10: continue
-            await upload_file(client, msg, f, message.from_user.mention)
-            if is_extracted or os.path.isdir(file_path): 
+        if is_extracted or os.path.isdir(file_path): 
+            try: shutil.rmtree(file_path) # Remove original folder
+            except: pass
+            for f in final_files: # Remove extracted files
                 try: os.remove(f)
                 except: pass
-                
+        else:
+             try: os.remove(file_path)
+             except: pass
+
         await msg.delete()
         if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-        if os.path.isdir(file_path): shutil.rmtree(file_path)
-        elif os.path.exists(file_path): os.remove(file_path)
         aria2.purge()
         
     except Exception as e:
@@ -312,24 +349,32 @@ async def process_task(client, message, url, mode="auto"):
 # --- Commands ---
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
-    caption = "**👋 Bot Started!**\n⚡ [Powered by Ayuprime](tg://user?id=8428298917)\n\nSend any link to download."
+    caption = "**👋 Bot Started!**\n⚡ [Powered by Ayuprime](tg://user?id=8428298917)\n\n"
+    caption += "📥 **/leech link** -> Upload to Telegram\n"
+    caption += "🚀 **/rclone link** -> Upload to Drive (Rclone)\n"
     try: await m.reply_photo(photo="start_img.jpg", caption=caption)
     except: await m.reply_text(caption)
 
 @app.on_message(filters.command("leech"))
 async def leech_cmd(c, m): 
     link = m.text.split(None, 1)[1] if len(m.command)>1 else (m.reply_to_message.text if m.reply_to_message else "")
-    if link: await process_task(c, m, link, "leech")
+    if link: await process_task(c, m, link, "auto", "tg")
+
+@app.on_message(filters.command("rclone"))
+async def rclone_cmd(c, m): 
+    link = m.text.split(None, 1)[1] if len(m.command)>1 else (m.reply_to_message.text if m.reply_to_message else "")
+    if link: await process_task(c, m, link, "auto", "rclone")
 
 @app.on_message(filters.command("ytdl"))
 async def ytdl_cmd(c, m):
     link = m.text.split(None, 1)[1] if len(m.command)>1 else (m.reply_to_message.text if m.reply_to_message else "")
-    if link: await process_task(c, m, link, "ytdl")
+    if link: await process_task(c, m, link, "ytdl", "tg")
 
 @app.on_message(filters.text & filters.private)
 async def auto_cmd(c, m):
     if not m.text.startswith("/") and (m.text.startswith("http") or m.text.startswith("magnet:")):
-        await process_task(c, m, m.text, "auto")
+        # Default to Telegram upload for direct links
+        await process_task(c, m, m.text, "auto", "tg")
 
 @app.on_callback_query(filters.regex("cancel_task"))
 async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Cancelling...")
@@ -347,6 +392,4 @@ async def web_server():
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
-    
-        
         
