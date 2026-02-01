@@ -1,4 +1,4 @@
-import os
+ import os
 import time
 import asyncio
 import aiohttp
@@ -8,6 +8,7 @@ import aria2p
 import subprocess
 import shutil
 import traceback
+import re
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -18,8 +19,7 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 MONGO_URL = os.environ.get("MONGO_URL")
-# Example: "MyDrive:Downloads" (Name from rclone.conf : Folder Path)
-RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:") 
+RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:")
 PORT = int(os.environ.get("PORT", 8080))
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -72,6 +72,13 @@ def time_formatter(seconds: int) -> str:
     hours, minutes = divmod(minutes, 60)
     return "{:02d}:{:02d}:{:02d}".format(int(hours), int(minutes), int(seconds))
 
+# --- NEW: Fixes Telegram 400 Error ---
+def escape_md(text):
+    if not text: return ""
+    text = str(text)
+    # Escape special characters that break markdown
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
+
 async def take_screenshot(video_path):
     try:
         thumb_path = f"{video_path}.jpg"
@@ -95,6 +102,7 @@ async def update_progress_ui(current, total, message, start_time, action, downlo
         filled = int(percentage // 10)
         bar = '☁️' * filled + '◌' * (10 - filled)
         
+        # Use simple text format to avoid markdown errors in progress
         text = f"⚡ [Powered by Ayuprime](tg://user?id=8428298917)\n\n"
         text += f"**{action}**\n\n"
         text += f"{bar}  `{round(percentage, 1)}%`\n\n"
@@ -134,38 +142,31 @@ def get_files_from_folder(folder_path):
         for file in files: files_list.append(os.path.join(root, file))
     return files_list
 
-# --- Rclone Upload ---
+# --- Rclone Upload (FIXED) ---
 async def rclone_upload_file(message, file_path):
     file_name = os.path.basename(file_path)
-    # Use config from repo or default location
-    config_path = "rclone.conf" 
+    config_path = "rclone.conf"
     
     if not os.path.exists(config_path):
-         await message.edit_text("❌ `rclone.conf` not found in bot root!")
+         await message.edit_text("❌ `rclone.conf` not found!")
          return False
 
-    cmd = [
-        "rclone", "copy", file_path, RCLONE_PATH,
-        "--config", config_path,
-        "--progress"
-    ]
+    # Safe Filename for Display
+    safe_name = escape_md(file_name)
     
-    await message.edit_text(f"🚀 **Rclone Uploading:** `{file_name}`\nTarget: `{RCLONE_PATH}`")
+    await message.edit_text(f"🚀 **Rclone Uploading:** `{safe_name}`")
     
-    process = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    
-    # Rclone doesn't give easy progress parsing in python without complex regex
-    # So we just wait for it to finish
+    cmd = ["rclone", "copy", file_path, RCLONE_PATH, "--config", config_path]
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     await process.wait()
     
     if process.returncode == 0:
-        await message.edit_text(f"✅ **Rclone Uploaded!**\nFile: `{file_name}`")
+        await message.edit_text(f"✅ **Rclone Uploaded!**\nFile: `{safe_name}`")
         return True
     else:
         stderr = await process.stderr.read()
-        await message.edit_text(f"❌ **Rclone Failed:**\n`{stderr.decode()}`")
+        error_text = escape_md(stderr.decode())
+        await message.edit_text(f"❌ **Rclone Failed:**\n`{error_text}`")
         return False
 
 # --- Telegram Upload Helper ---
@@ -177,7 +178,8 @@ async def upload_file(client, message, file_path, user_mention):
         is_video = file_name.lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv'))
         if is_video: thumb_path = await take_screenshot(file_path)
         
-        caption = f"☁️ **File:** `{file_name}`\n📦 **Size:** `{humanbytes(os.path.getsize(file_path))}`\n👤 **User:** {user_mention}"
+        safe_filename = escape_md(file_name)
+        caption = f"☁️ **File:** `{safe_filename}`\n📦 **Size:** `{humanbytes(os.path.getsize(file_path))}`\n👤 **User:** {user_mention}"
         
         await message.reply_document(
             document=file_path, caption=caption, thumb=thumb_path,
@@ -198,7 +200,6 @@ async def download_logic(url, message, user_id, mode):
 
     try:
         file_path = None
-        
         # 1. Torrent / Magnet
         if mode == "leech" or url.startswith("magnet:") or url.lower().endswith(".torrent"):
             download = None
@@ -211,8 +212,8 @@ async def download_logic(url, message, user_id, mode):
                                 meta = f"meta_{user_id}.torrent"
                                 with open(meta, "wb") as f: f.write(data)
                                 try: download = aria2.add_torrent(meta)
-                                except: return f"ERROR: Invalid Torrent File (Try Magnet)."
-                            else: return f"ERROR: Link returned status {res.status}"
+                                except: return f"ERROR: Invalid Torrent File."
+                            else: return f"ERROR: Link status {res.status}"
                 except Exception as e: return f"ERROR: Fetch failed {e}"
             else:
                 try: download = aria2.add_magnet(url)
@@ -225,7 +226,7 @@ async def download_logic(url, message, user_id, mode):
                 if user_id in abort_dict: aria2.remove([download]); return "CANCELLED"
                 download.update()
                 
-                if download.status == "error": return "ERROR: Aria2 Error (Dead link/Full Storage)."
+                if download.status == "error": return "ERROR: Aria2 Dead/Storage Full."
                 
                 if download.status == "complete" or (download.total_length > 0 and download.completed_length == download.total_length):
                     file_path = str(download.files[0].path)
@@ -291,7 +292,8 @@ async def process_task(client, message, url, mode="auto", upload_target="tg"):
         file_path = await download_logic(url, msg, user_id, mode)
         
         if str(file_path).startswith("ERROR"):
-            await msg.edit_text(f"❌ **Failed!**\nReason: `{file_path}`")
+            safe_error = escape_md(str(file_path))
+            await msg.edit_text(f"❌ **Failed!**\nReason: `{safe_error}`")
             return
         
         if file_path == "CANCELLED": await msg.edit_text("❌ Cancelled."); return
@@ -307,7 +309,7 @@ async def process_task(client, message, url, mode="auto", upload_target="tg"):
             await msg.edit_text("📦 **Extracting Archive...**")
             extracted_list, temp_dir, error_msg = extract_archive(file_path)
             if error_msg:
-                await msg.edit_text(f"⚠️ Extract Failed: `{error_msg}`\nUploading zip...")
+                await msg.edit_text(f"⚠️ Extract Failed: `{escape_md(error_msg)}`\nUploading zip...")
                 final_files = [file_path]
             else:
                 final_files = extracted_list; is_extracted = True; os.remove(file_path)
@@ -317,19 +319,19 @@ async def process_task(client, message, url, mode="auto", upload_target="tg"):
         
         # --- UPLOAD PHASE ---
         if upload_target == "rclone":
-            await msg.edit_text(f"🚀 **Starting Rclone Upload ({len(final_files)} files)...**")
+            await msg.edit_text(f"🚀 **Starting Rclone Upload...**")
             for f in final_files:
                 await rclone_upload_file(msg, f)
         else:
-            await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files to Telegram...**")
+            await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
             for f in final_files:
                 if os.path.getsize(f) < 1024*10: continue
                 await upload_file(client, msg, f, message.from_user.mention)
         
         if is_extracted or os.path.isdir(file_path): 
-            try: shutil.rmtree(file_path) # Remove original folder
+            try: shutil.rmtree(file_path) 
             except: pass
-            for f in final_files: # Remove extracted files
+            for f in final_files: 
                 try: os.remove(f)
                 except: pass
         else:
@@ -341,7 +343,7 @@ async def process_task(client, message, url, mode="auto", upload_target="tg"):
         aria2.purge()
         
     except Exception as e:
-        await message.reply_text(f"⚠️ Error: `{str(e)}`")
+        await message.reply_text(f"⚠️ Error: `{escape_md(str(e))}`")
         traceback.print_exc()
     finally:
         if message.id in processing_ids: processing_ids.remove(message.id)
@@ -351,7 +353,7 @@ async def process_task(client, message, url, mode="auto", upload_target="tg"):
 async def start_cmd(c, m):
     caption = "**👋 Bot Started!**\n⚡ [Powered by Ayuprime](tg://user?id=8428298917)\n\n"
     caption += "📥 **/leech link** -> Upload to Telegram\n"
-    caption += "🚀 **/rclone link** -> Upload to Drive (Rclone)\n"
+    caption += "🚀 **/rclone link** -> Upload to Cloud\n"
     try: await m.reply_photo(photo="start_img.jpg", caption=caption)
     except: await m.reply_text(caption)
 
@@ -373,7 +375,6 @@ async def ytdl_cmd(c, m):
 @app.on_message(filters.text & filters.private)
 async def auto_cmd(c, m):
     if not m.text.startswith("/") and (m.text.startswith("http") or m.text.startswith("magnet:")):
-        # Default to Telegram upload for direct links
         await process_task(c, m, m.text, "auto", "tg")
 
 @app.on_callback_query(filters.regex("cancel_task"))
@@ -392,4 +393,3 @@ async def web_server():
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
-        
