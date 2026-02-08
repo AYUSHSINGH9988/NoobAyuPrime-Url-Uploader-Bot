@@ -9,6 +9,7 @@ import subprocess
 import shutil
 import traceback
 import re
+import urllib.parse
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -17,7 +18,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 MONGO_URL = os.environ.get("MONGO_URL")
 RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:")
 PORT = int(os.environ.get("PORT", 8080))
@@ -31,7 +31,6 @@ if not MONGO_URL:
 else:
     mongo_client = AsyncIOMotorClient(MONGO_URL)
     mongo_db = mongo_client["URL_Uploader_Bot"]
-    config_col = mongo_db["config"]
     users_col = mongo_db["users"]
 
 # --- Initialize Aria2 ---
@@ -55,7 +54,10 @@ except Exception as e:
 
 # --- Globals ---
 abort_dict = {}
-processing_ids = []
+# Queue System: {user_id: [list_of_links]}
+user_queues = {}
+# Processing Status: {user_id: True/False}
+is_processing = {}
 YTDLP_LIMIT = 2000 * 1024 * 1024
 
 # --- Helper Functions ---
@@ -72,11 +74,9 @@ def time_formatter(seconds: int) -> str:
     hours, minutes = divmod(minutes, 60)
     return "{:02d}:{:02d}:{:02d}".format(int(hours), int(minutes), int(seconds))
 
-# --- NEW: Fixes Telegram 400 Error ---
 def escape_md(text):
     if not text: return ""
     text = str(text)
-    # Escape special characters that break markdown
     return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
 
 async def take_screenshot(video_path):
@@ -94,16 +94,16 @@ async def update_progress_ui(current, total, message, start_time, action, downlo
     now = time.time()
     diff = now - start_time
     if round(diff % 5.00) == 0 or current == total:
-        percentage = current * 100 / total
+        percentage = current * 100 / total if total > 0 else 0
         speed = current / diff if diff > 0 else 0
         elapsed = round(diff)
         eta = round((total - current) / speed) if speed > 0 else 0
         
         filled = int(percentage // 10)
-        bar = '☁️' * filled + '◌' * (10 - filled)
+        bar = '⚡' * filled + '◌' * (10 - filled)
         
-        # Use simple text format to avoid markdown errors in progress
-        text = f"⚡ [Powered by Ayuprime](tg://user?id=8428298917)\n\n"
+        # UPDATED: Link ID changed to 8493596199
+        text = f"⚡ [Powered by Ayuprime](tg://user?id=8493596199)\n\n"
         text += f"**{action}**\n\n"
         text += f"{bar}  `{round(percentage, 1)}%`\n\n"
         text += f"💾 **Size:** `{humanbytes(current)}` / `{humanbytes(total)}`\n"
@@ -142,7 +142,7 @@ def get_files_from_folder(folder_path):
         for file in files: files_list.append(os.path.join(root, file))
     return files_list
 
-# --- Rclone Upload (FIXED) ---
+# --- NEW: Rclone Upload WITH Progress ---
 async def rclone_upload_file(message, file_path):
     file_name = os.path.basename(file_path)
     config_path = "rclone.conf"
@@ -151,21 +151,56 @@ async def rclone_upload_file(message, file_path):
          await message.edit_text("❌ `rclone.conf` not found!")
          return False
 
-    # Safe Filename for Display
     safe_name = escape_md(file_name)
+    await message.edit_text(f"🚀 **Preparing Rclone Upload:** `{safe_name}`")
     
-    await message.edit_text(f"🚀 **Rclone Uploading:** `{safe_name}`")
+    # Rclone command with progress
+    cmd = ["rclone", "copy", file_path, RCLONE_PATH, "--config", config_path, "-P"]
     
-    cmd = ["rclone", "copy", file_path, RCLONE_PATH, "--config", config_path]
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    start_time = time.time()
+    last_update = 0
+    
+    # Read Rclone output line by line for progress
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        
+        decoded_line = line.decode().strip()
+        now = time.time()
+        
+        # Parsing Logic for Rclone Output (Transferred: 50% / 100%, etc)
+        # Regex to find percentage like "45%"
+        if "%" in decoded_line and (now - last_update) > 4:
+            match = re.search(r"(\d+)%", decoded_line)
+            if match:
+                percent = match.group(1)
+                text = f"⚡ [Powered by Ayuprime](tg://user?id=8493596199)\n\n"
+                text += f"🚀 **Rclone Uploading...**\n"
+                text += f"📂 **File:** `{safe_name}`\n"
+                text += f"📊 **Progress:** `{percent}%`\n"
+                text += f"⚡ **Status:** `{escape_md(decoded_line)}`"
+                
+                try: 
+                    await message.edit_text(text)
+                    last_update = now
+                except: pass
+
     await process.wait()
     
     if process.returncode == 0:
         await message.edit_text(f"✅ **Rclone Uploaded!**\nFile: `{safe_name}`")
         return True
     else:
+        # Check stderr for errors
         stderr = await process.stderr.read()
-        error_text = escape_md(stderr.decode())
+        error_text = escape_md(stderr.decode())[:1000] # Limit error length
         await message.edit_text(f"❌ **Rclone Failed:**\n`{error_text}`")
         return False
 
@@ -191,6 +226,23 @@ async def upload_file(client, message, file_path, user_mention):
     except Exception as e:
         print(f"Upload Error: {e}")
         return False
+
+# --- NEW: Get Real Filename ---
+def get_filename_from_header(url, headers):
+    try:
+        if "Content-Disposition" in headers:
+            cd = headers["Content-Disposition"]
+            if 'filename="' in cd:
+                name = cd.split('filename="')[1].split('"')[0]
+                return name
+            elif "filename=" in cd:
+                name = cd.split("filename=")[1].split(";")[0]
+                return name
+    except: pass
+    
+    # Fallback: Extract from URL and unquote
+    name = url.split("/")[-1].split("?")[0]
+    return urllib.parse.unquote(name)
 
 # --- Download Logic ---
 async def download_logic(url, message, user_id, mode):
@@ -255,15 +307,19 @@ async def download_logic(url, message, user_id, mode):
                      return ydl.prepare_filename(info)
              file_path = await loop.run_in_executor(None, run)
 
-        # 3. Direct
+        # 3. Direct Link (Updated for Real Filename)
         else:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         total = int(resp.headers.get("content-length", 0))
-                        name = url.split("/")[-1].split("?")[0]
-                        if "pixeldrain" in url: name = "pixeldrain_file"
+                        
+                        # Fix: Get Real Filename
+                        name = get_filename_from_header(url, resp.headers)
+                        
+                        if "pixeldrain" in url: name = "pixeldrain_file.mp4" # Fallback
                         if "." not in name: name += ".mp4"
+                        
                         file_path = name
                         f = await aiofiles.open(file_path, mode='wb')
                         dl_size = 0; start_time = time.time()
@@ -276,19 +332,19 @@ async def download_logic(url, message, user_id, mode):
         return str(file_path) if file_path else None
     except Exception as e: return f"ERROR: {str(e)}"
 
-# --- Main Processor ---
+# --- Main Task Processor (Updated for Queue) ---
 async def process_task(client, message, url, mode="auto", upload_target="tg"):
     user_id = message.from_user.id
-    if message.id in processing_ids: return
-    processing_ids.append(message.id)
-
+    
+    # Send initial status
+    msg = await message.reply_text("☁️ **Connecting...**")
+    
     try:
         if mongo_db is not None:
              await users_col.update_one({"_id": user_id}, {"$set": {"active": True}}, upsert=True)
 
         if user_id in abort_dict: del abort_dict[user_id]
         
-        msg = await message.reply_text("☁️ **Connecting...**")
         file_path = await download_logic(url, msg, user_id, mode)
         
         if str(file_path).startswith("ERROR"):
@@ -319,7 +375,7 @@ async def process_task(client, message, url, mode="auto", upload_target="tg"):
         
         # --- UPLOAD PHASE ---
         if upload_target == "rclone":
-            await msg.edit_text(f"🚀 **Starting Rclone Upload...**")
+            # Rclone progress is handled inside rclone_upload_file
             for f in final_files:
                 await rclone_upload_file(msg, f)
         else:
@@ -345,37 +401,71 @@ async def process_task(client, message, url, mode="auto", upload_target="tg"):
     except Exception as e:
         await message.reply_text(f"⚠️ Error: `{escape_md(str(e))}`")
         traceback.print_exc()
-    finally:
-        if message.id in processing_ids: processing_ids.remove(message.id)
+
+# --- Queue Manager ---
+async def queue_manager(client, user_id):
+    if is_processing.get(user_id, False):
+        return # Already processing
+    
+    is_processing[user_id] = True
+    
+    while user_id in user_queues and user_queues[user_id]:
+        task = user_queues[user_id].pop(0) # Get first task
+        link, message, mode, target = task
+        
+        await message.reply_text(f"🔢 **Processing Queue:** {link}")
+        await process_task(client, message, link, mode, target)
+        await asyncio.sleep(2) # Cool down
+        
+    is_processing[user_id] = False
+    await client.send_message(user_id, "✅ **All Queue Tasks Completed!**")
 
 # --- Commands ---
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
-    caption = "**👋 Bot Started!**\n⚡ [Powered by Ayuprime](tg://user?id=8428298917)\n\n"
+    caption = "**👋 Bot Started!**\n⚡ [Powered by Ayuprime](tg://user?id=8493596199)\n\n"
     caption += "📥 **/leech link** -> Upload to Telegram\n"
     caption += "🚀 **/rclone link** -> Upload to Cloud\n"
+    caption += "🔢 **/queue link1 link2** -> Process multiple links"
     try: await m.reply_photo(photo="start_img.jpg", caption=caption)
     except: await m.reply_text(caption)
 
-@app.on_message(filters.command("leech"))
-async def leech_cmd(c, m): 
-    link = m.text.split(None, 1)[1] if len(m.command)>1 else (m.reply_to_message.text if m.reply_to_message else "")
-    if link: await process_task(c, m, link, "auto", "tg")
+@app.on_message(filters.command(["leech", "rclone", "queue", "ytdl"]))
+async def command_handler(c, m):
+    cmd = m.command[0]
+    user_id = m.from_user.id
+    
+    # Extract text (Check reply or command args)
+    text = ""
+    if m.reply_to_message:
+        text = m.reply_to_message.text
+    elif len(m.command) > 1:
+        text = m.text.split(None, 1)[1]
+    
+    if not text:
+        await m.reply_text("❌ No links found!")
+        return
 
-@app.on_message(filters.command("rclone"))
-async def rclone_cmd(c, m): 
-    link = m.text.split(None, 1)[1] if len(m.command)>1 else (m.reply_to_message.text if m.reply_to_message else "")
-    if link: await process_task(c, m, link, "auto", "rclone")
-
-@app.on_message(filters.command("ytdl"))
-async def ytdl_cmd(c, m):
-    link = m.text.split(None, 1)[1] if len(m.command)>1 else (m.reply_to_message.text if m.reply_to_message else "")
-    if link: await process_task(c, m, link, "ytdl", "tg")
-
-@app.on_message(filters.text & filters.private)
-async def auto_cmd(c, m):
-    if not m.text.startswith("/") and (m.text.startswith("http") or m.text.startswith("magnet:")):
-        await process_task(c, m, m.text, "auto", "tg")
+    # Split lines for multiple links
+    links = text.strip().split()
+    
+    # Determine mode/target
+    mode = "ytdl" if cmd == "ytdl" else "auto"
+    target = "rclone" if cmd == "rclone" else "tg"
+    
+    # Add to queue
+    if user_id not in user_queues: user_queues[user_id] = []
+    
+    count = 0
+    for link in links:
+        if link.startswith("http") or link.startswith("magnet:"):
+            user_queues[user_id].append((link, m, mode, target))
+            count += 1
+            
+    await m.reply_text(f"✅ **Added {count} links to queue!**")
+    
+    # Trigger Queue Processor
+    asyncio.create_task(queue_manager(c, user_id))
 
 @app.on_callback_query(filters.regex("cancel_task"))
 async def cancel(c, cb): abort_dict[cb.from_user.id] = True; await cb.answer("Cancelling...")
@@ -393,3 +483,4 @@ async def web_server():
 
 if __name__ == "__main__":
     app.start(); app.loop.run_until_complete(web_server()); app.loop.run_forever()
+                    
