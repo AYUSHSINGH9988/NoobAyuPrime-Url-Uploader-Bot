@@ -23,7 +23,8 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URL = os.environ.get("MONGO_URL")
 RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:")
-# Dump Channel ID (Ensure it is Integer)
+
+# Dump Channel ID
 try:
     DUMP_CHANNEL = int(str(os.environ.get("DUMP_CHANNEL", "0")).strip())
 except:
@@ -228,13 +229,11 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
             progress_args=(message, time.time(), "☁️ Uploading...", file_name, queue_pos)
         )
         
-        # --- IMPROVED DUMP LOGIC (By File ID) ---
+        # --- DUMP LOGIC ---
         if DUMP_CHANNEL != 0:
             try:
-                # Use File ID instead of .copy() for reliability in queues
+                # Use File ID for reliability
                 file_id = sent_msg.document.file_id if sent_msg.document else sent_msg.video.file_id
-                
-                # Send by File ID (No re-upload)
                 await client.send_document(
                     chat_id=DUMP_CHANNEL, 
                     document=file_id, 
@@ -242,7 +241,6 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
                 )
             except Exception as e:
                 print(f"❌ Dump Failed: {e}")
-                # Fallback to copy if ID extraction fails
                 try: await sent_msg.copy(DUMP_CHANNEL)
                 except: pass
         
@@ -253,60 +251,133 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
         return False
 
 # ==========================================
-#           DOWNLOAD LOGIC (UPDATED)
+#           DOWNLOAD LOGIC (FIXED)
 # ==========================================
 async def download_logic(url, message, user_id, mode, queue_pos=None):
-    # --- Pixeldrain Handling (Fix Real Filename) ---
+    # --- 1. PIXELDRAIN PRE-PROCESSING (API Check) ---
+    pd_filename = None
     if "pixeldrain.com" in url:
         try:
-            # ID Extract karna (e.g., /u/12345 -> 12345)
-            file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
+            # ID Extraction
+            if "/u/" in url:
+                file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
+            else:
+                file_id = url.split("/")[-1]
             
-            # API se Info nikalna
+            # API Call for Metadata
             api_url = f"https://pixeldrain.com/api/file/{file_id}/info"
             async with aiohttp.ClientSession() as session:
                 async with session.get(api_url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        # Asli naam API se milega
-                        file_name = data.get("name", f"pixeldrain_{file_id}.mp4")
-                        # Download link banana
+                        pd_filename = data.get("name")
+                        # Convert to Download Link
                         url = f"https://pixeldrain.com/api/file/{file_id}"
-                    else:
-                        return "ERROR: Pixeldrain API Failed."
         except Exception as e:
-            print(f"Pixeldrain Error: {e}")
-            # Agar API fail ho jaye to purana method use karein
-            url = f"https://pixeldrain.com/api/file/{url.split('pixeldrain.com/u/')[1].split('/')[0]}"
-            file_name = "pixeldrain_file.mp4"
+            print(f"Pixeldrain API Error: {e}")
 
     try:
         file_path = None
         filename_display = "Getting Metadata..."
 
-        # ... (Baaki ka Torrent/Magnet logic same rahega) ...
+        # --- 2. TORRENT / MAGNET LOGIC ---
+        if url.startswith("magnet:") or url.endswith(".torrent"):
+            try:
+                if url.endswith(".torrent"):
+                    # Download .torrent file first
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url) as resp:
+                            if resp.status != 200: return "ERROR: Torrent File Download Failed"
+                            torrent_path = f"task_{int(time.time())}.torrent"
+                            with open(torrent_path, "wb") as f: f.write(await resp.read())
+                    download = aria2.add_torrent(torrent_path)
+                else:
+                    download = aria2.add_magnet(url)
+                
+                gid = download.gid
+                
+                # Aria2 Monitoring Loop
+                while True:
+                    if message.id in abort_dict:
+                        aria2.remove([gid])
+                        return "CANCELLED"
+                        
+                    try:
+                        status = aria2.tell_status(gid)
+                        if status.status == "complete":
+                            file_path = status.files[0].path
+                            break
+                        elif status.status == "error":
+                            return "ERROR: Aria2 Download Failed"
+                            
+                        # Update Progress
+                        completed = int(status.completed_length)
+                        total = int(status.total_length)
+                        if total > 0:
+                            await update_progress_ui(completed, total, message, time.time(), "☁️ Torrent Downloading...", status.name, queue_pos)
+                            
+                    except:
+                        await asyncio.sleep(2)
+                        continue
+                    await asyncio.sleep(2)
+                    
+            except Exception as e:
+                return f"ERROR: Aria2 - {str(e)}"
 
-        # --- 3. Direct Link / Pixeldrain Logic ---
+        # --- 3. YOUTUBE / YT-DLP LOGIC ---
+        elif "youtube.com" in url or "youtu.be" in url or mode == "ytdl":
+            try:
+                ydl_opts = {
+                    'format': 'bestvideo+bestaudio/best',
+                    'outtmpl': '%(title)s.%(ext)s',
+                    'noplaylist': True,
+                    'quiet': True,
+                    'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    filename_display = info.get('title', 'YouTube Video')
+                    
+                    # Size Check
+                    if info.get('filesize', 0) > YTDLP_LIMIT:
+                        return "ERROR: Video larger than 2GB limit"
+                        
+                    ydl.download([url])
+                    file_path = ydl.prepare_filename(info)
+                    
+            except Exception as e:
+                return f"ERROR: YT-DLP - {str(e)}"
+
+        # --- 4. DIRECT LINK / PIXELDRAIN LOGIC (FIXED) ---
         else:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         total = int(resp.headers.get("content-length", 0))
                         
-                        # Agar Pixeldrain se naam mil gaya hai to wahi use karein
-                        if "pixeldrain.com" in url and 'file_name' in locals():
-                            name = file_name
-                        else:
-                            # Normal links ke liye header se naam nikalein
-                            name = get_filename_from_header(url, resp.headers)
+                        # --- FILENAME DETECTION ---
+                        name = pd_filename # Agar Pixeldrain se mila to wo use karo
                         
-                        if not name or name == "pixeldrain_file.mp4":
-                             # Agar abhi bhi naam nahi mila to URL se nikalein
-                             name = os.path.basename(str(url)).split("?")[0]
+                        if not name:
+                            # Try from Headers
+                            try:
+                                if "Content-Disposition" in resp.headers:
+                                    cd = resp.headers["Content-Disposition"]
+                                    if 'filename="' in cd: name = cd.split('filename="')[1].split('"')[0]
+                                    elif "filename=" in cd: name = cd.split("filename=")[1].split(";")[0]
+                            except: pass
                         
-                        # Extension check
+                        if not name:
+                            # Try from URL
+                            name = os.path.basename(str(url)).split("?")[0]
+                        
+                        # Fallback
+                        if not name: name = "downloaded_file"
                         if "." not in name: name += ".mp4"
                         
+                        # Clean Filename
+                        name = urllib.parse.unquote(name)
                         file_path = name
                         filename_display = name
 
@@ -314,6 +385,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                         f = await aiofiles.open(file_path, mode='wb')
                         dl_size = 0
                         start_time = time.time()
+                        last_update = 0
                         
                         async for chunk in resp.content.iter_chunked(1024*1024):
                             if message.id in abort_dict: 
@@ -321,11 +393,17 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                             
                             await f.write(chunk)
                             dl_size += len(chunk)
-                            await update_progress_ui(
-                                dl_size, total, message, start_time, 
-                                "☁️ Downloading...", filename_display, queue_pos
-                            )
+                            
+                            # Throttle UI Updates (Every 4s)
+                            if (time.time() - last_update > 4) or (dl_size == total):
+                                await update_progress_ui(
+                                    dl_size, total, message, start_time, 
+                                    "☁️ Downloading...", filename_display, queue_pos
+                                )
+                                last_update = time.time()
                         await f.close()
+                    else:
+                        return f"ERROR: HTTP {resp.status}"
                         
         return str(file_path) if file_path else None
     except Exception as e: 
@@ -351,27 +429,30 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
         if not file_path or not os.path.exists(file_path): await msg.edit_text("❌ Download Failed."); return
         
         file_path = str(file_path); final_files = []; temp_dir = None; is_extracted = False
+        
+        # Check for Folder or Archive
         if os.path.isdir(file_path):
             await msg.edit_text(f"📂 <b>Processing Folder...</b>\n<code>{os.path.basename(file_path)}</code>")
             final_files = get_files_from_folder(file_path)
         elif file_path.lower().endswith((".zip", ".rar", ".7z", ".tar")):
             await msg.edit_text(f"📦 <b>Extracting...</b>\n<code>{os.path.basename(file_path)}</code>")
             extracted_list, temp_dir, error_msg = extract_archive(file_path)
-            if error_msg: final_files = [file_path]
+            if error_msg: final_files = [file_path] # Extract fail hua to original file upload karo
             else: final_files = extracted_list; is_extracted = True; os.remove(file_path)
         else: final_files = [file_path]
         
         if not final_files: await msg.edit_text("❌ No files found."); return
         
+        # Uploading
         if upload_target == "rclone":
             for f in final_files: await rclone_upload_file(msg, f, queue_pos)
         else:
             await msg.edit_text(f"☁️ <b>Uploading {len(final_files)} Files...</b>")
             for f in final_files:
-                if os.path.getsize(f) < 1024*10: continue
-                # Pass 'client' properly for dumping
+                if os.path.getsize(f) < 1024*10: continue # Skip very small files
                 await upload_file(client, msg, f, message.from_user.mention, queue_pos)
         
+        # Cleanup
         if is_extracted or os.path.isdir(file_path): 
             try: shutil.rmtree(file_path) 
             except: pass
@@ -382,78 +463,9 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
              try: os.remove(file_path) 
              except: pass
 
-        await msg.delete(); aria2.purge()
+        await msg.delete()
+        aria2.purge()
         if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    except Exception as e: await msg.edit_text(f"⚠️ Error: <code>{str(e)}</code>"); traceback.print_exc()
-
-async def queue_manager(client, user_id):
-    if is_processing.get(user_id, False): return
-    is_processing[user_id] = True
-    while user_id in user_queues and user_queues[user_id]:
-        task = user_queues[user_id].pop(0); link, message, mode, target = task
-        queue_status = f"1/{len(user_queues[user_id]) + 1}"
-        await process_task(client, message, link, mode, target, queue_pos=queue_status)
-    is_processing[user_id] = False
-    await client.send_message(user_id, "✅ <b>Queue Completed!</b>")
-
-# ==========================================
-#           COMMANDS
-# ==========================================
-@app.on_message(filters.command("start"))
-async def start_cmd(c, m):
-    caption = "<b>👋 Bot Started!</b>\n☁️ <a href='tg://user?id=8493596199'>Powered by Ayuprime</a>\n\n📥 <b>Usage:</b>\n• Send Link -> Leech\n• <code>/rclone link</code> -> Cloud\n• <code>/queue link1 link2</code> -> Queue"
-    try: await m.reply_photo(photo="start_img.jpg", caption=caption)
-    except: await m.reply_text(caption)
-
-@app.on_message(filters.command(["leech", "rclone", "queue", "ytdl"]))
-async def command_handler(c, m):
-    cmd = m.command[0]; user_id = m.from_user.id
-    text = m.reply_to_message.text if m.reply_to_message else (m.text.split(None, 1)[1] if len(m.command) > 1 else "")
-    if not text: await m.reply_text("❌ No link!"); return
-
-    links = text.strip().split(); mode = "ytdl" if cmd == "ytdl" else "auto"
-    target = "rclone" if cmd == "rclone" else "tg"
-    
-    if cmd == "queue":
-        if user_id not in user_queues: user_queues[user_id] = []
-        for link in links:
-            if link.startswith("http") or link.startswith("magnet:"): user_queues[user_id].append((link, m, mode, target))
-        await m.reply_text(f"✅ <b>Added to Queue.</b>"); asyncio.create_task(queue_manager(c, user_id))
-    else:
-        for link in links:
-            if link.startswith("http") or link.startswith("magnet:"): asyncio.create_task(process_task(c, m, link, mode, target))
-
-@app.on_message(filters.text & filters.private)
-async def auto_cmd(c, m):
-    if not m.text.startswith("/") and (m.text.startswith("http") or m.text.startswith("magnet:")):
-        asyncio.create_task(process_task(c, m, m.text, "auto", "tg"))
-
-@app.on_callback_query(filters.regex(r"cancel_(\d+)"))
-async def cancel(c, cb):
-    try: abort_dict[int(cb.data.split("_")[1])] = True; await cb.answer("Cancelling...")
-    except: await cb.answer("Error.")
-
-# ==========================================
-#           SERVER & STARTUP
-# ==========================================
-async def main():
-    print("🤖 Starting Bot Client...")
-    await app.start()
-    print("✅ Bot Started!")
-
-    print("🌍 Starting Web Server...")
-    async def handle(request): return web.Response(text="Bot Running")
-    web_app = web.Application()
-    web_app.router.add_get("/", handle)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"✅ Web Server running on Port {PORT}")
-
-    await idle()
-    await app.stop()
-
-if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+        
+    except Exception as e: 
+        await msg.edit_text(f"⚠️ Error: <c 
