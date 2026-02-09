@@ -10,7 +10,7 @@ import shutil
 import traceback
 import re
 import urllib.parse
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
@@ -23,11 +23,21 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URL = os.environ.get("MONGO_URL")
 RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:")
-DUMP_CHANNEL = int(os.environ.get("DUMP_CHANNEL", 0)) 
+# Dump Channel ID (Ensure it is Integer)
+try:
+    DUMP_CHANNEL = int(str(os.environ.get("DUMP_CHANNEL", "0")).strip())
+except:
+    DUMP_CHANNEL = 0
 PORT = int(os.environ.get("PORT", 8080))
 
 # Initialize Bot
-app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    "my_bot", 
+    api_id=API_ID, 
+    api_hash=API_HASH, 
+    bot_token=BOT_TOKEN,
+    parse_mode=enums.ParseMode.HTML
+)
 
 # ==========================================
 #           DATABASE CONNECTION
@@ -92,10 +102,9 @@ def time_formatter(seconds: int) -> str:
     hours, minutes = divmod(minutes, 60)
     return "{:02d}:{:02d}:{:02d}".format(int(hours), int(minutes), int(seconds))
 
-def escape_md(text):
+def clean_html(text):
     if not text: return ""
-    text = str(text)
-    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
+    return str(text).replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
 
 async def take_screenshot(video_path):
     try:
@@ -131,14 +140,14 @@ async def update_progress_ui(current, total, message, start_time, action, filena
         filled = int(percentage // 10)
         bar = '☁️' * filled + '◌' * (10 - filled)
         
-        text = f"☁️ [Powered by Ayuprime](tg://user?id=8493596199)\n\n"
-        text += f"📂 **File:** `{escape_md(filename)}`\n"
-        if queue_pos: text += f"🔢 **Queue:** `{queue_pos}`\n"
-        text += f"**{action}**\n\n"
-        text += f"{bar}  `{round(percentage, 1)}%`\n\n"
-        text += f"💾 **Size:** `{humanbytes(current)}` / `{humanbytes(total)}`\n"
-        text += f"🚀 **Speed:** `{humanbytes(speed)}/s`\n"
-        text += f"⏳ **ETA:** `{time_formatter(eta)}`\n"
+        text = f"☁️ <a href='tg://user?id=8493596199'>Powered by Ayuprime</a>\n\n"
+        text += f"📂 <b>File:</b> {clean_html(filename)}\n"
+        if queue_pos: text += f"🔢 <b>Queue:</b> <code>{queue_pos}</code>\n"
+        text += f"<b>{action}</b>\n\n"
+        text += f"{bar}  <code>{round(percentage, 1)}%</code>\n\n"
+        text += f"💾 <b>Size:</b> <code>{humanbytes(current)}</code> / <code>{humanbytes(total)}</code>\n"
+        text += f"🚀 <b>Speed:</b> <code>{humanbytes(speed)}/s</code>\n"
+        text += f"⏳ <b>ETA:</b> <code>{time_formatter(eta)}</code>\n"
         
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data=f"cancel_{message.id}")]])
         try: await message.edit_text(text, reply_markup=buttons)
@@ -170,10 +179,10 @@ def get_files_from_folder(folder_path):
 async def rclone_upload_file(message, file_path, queue_pos=None):
     file_name = os.path.basename(file_path)
     config_path = "rclone.conf"
-    if not os.path.exists(config_path): await message.edit_text("❌ `rclone.conf` missing!"); return False
+    if not os.path.exists(config_path): await message.edit_text("❌ <code>rclone.conf</code> missing!"); return False
 
-    safe_name = escape_md(file_name)
-    await message.edit_text(f"🚀 **Starting Rclone Upload...**\nFile: `{safe_name}`")
+    display_name = clean_html(file_name)
+    await message.edit_text(f"🚀 <b>Starting Rclone Upload...</b>\nFile: {display_name}")
     
     cmd = ["rclone", "copy", file_path, RCLONE_PATH, "--config", config_path, "-P"]
     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -188,16 +197,16 @@ async def rclone_upload_file(message, file_path, queue_pos=None):
         if "%" in decoded_line and (now - last_update) > 7:
             match = re.search(r"(\d+)%", decoded_line)
             if match:
-                text = f"☁️ [Powered by Ayuprime](tg://user?id=8493596199)\n\n"
-                text += f"📂 **File:** `{safe_name}`\n"
-                if queue_pos: text += f"🔢 **Queue:** `{queue_pos}`\n"
-                text += f"🚀 **Rclone Uploading...**\n📊 **Progress:** `{match.group(1)}%`\n⚡ **Status:** `{escape_md(decoded_line)}`"
+                text = f"☁️ <a href='tg://user?id=8493596199'>Powered by Ayuprime</a>\n\n"
+                text += f"📂 <b>File:</b> {display_name}\n"
+                if queue_pos: text += f"🔢 <b>Queue:</b> <code>{queue_pos}</code>\n"
+                text += f"🚀 <b>Rclone Uploading...</b>\n📊 <b>Progress:</b> <code>{match.group(1)}%</code>\n⚡ <b>Status:</b> <code>{clean_html(decoded_line)}</code>"
                 try: await message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data=f"cancel_{message.id}")]])); last_update = now
                 except: pass
 
     await process.wait()
-    if process.returncode == 0: await message.edit_text(f"✅ **Rclone Uploaded!**\nFile: `{safe_name}`"); return True
-    else: await message.edit_text(f"❌ **Rclone Failed!**"); return False
+    if process.returncode == 0: await message.edit_text(f"✅ <b>Rclone Uploaded!</b>\nFile: {display_name}"); return True
+    else: await message.edit_text(f"❌ <b>Rclone Failed!</b>"); return False
 
 async def upload_file(client, message, file_path, user_mention, queue_pos=None):
     try:
@@ -207,16 +216,41 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
         is_video = file_name.lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv'))
         if is_video: thumb_path = await take_screenshot(file_path)
         
-        safe_filename = escape_md(file_name)
-        caption = f"☁️ **File:** `{safe_filename}`\n📦 **Size:** `{humanbytes(os.path.getsize(file_path))}`\n👤 **User:** {user_mention}"
+        caption = f"☁️ <b>File:</b> {clean_html(file_name)}\n📦 <b>Size:</b> <code>{humanbytes(os.path.getsize(file_path))}</code>\n👤 <b>User:</b> {user_mention}"
         
-        sent_msg = await message.reply_document(document=file_path, caption=caption, thumb=thumb_path, force_document=False, progress=update_progress_ui, progress_args=(message, time.time(), "☁️ Uploading...", file_name, queue_pos))
-        if DUMP_CHANNEL:
-            try: await sent_msg.copy(DUMP_CHANNEL)
-            except: pass
+        # Upload to User
+        sent_msg = await message.reply_document(
+            document=file_path, 
+            caption=caption, 
+            thumb=thumb_path, 
+            force_document=False, 
+            progress=update_progress_ui, 
+            progress_args=(message, time.time(), "☁️ Uploading...", file_name, queue_pos)
+        )
+        
+        # --- IMPROVED DUMP LOGIC (By File ID) ---
+        if DUMP_CHANNEL != 0:
+            try:
+                # Use File ID instead of .copy() for reliability in queues
+                file_id = sent_msg.document.file_id if sent_msg.document else sent_msg.video.file_id
+                
+                # Send by File ID (No re-upload)
+                await client.send_document(
+                    chat_id=DUMP_CHANNEL, 
+                    document=file_id, 
+                    caption=caption
+                )
+            except Exception as e:
+                print(f"❌ Dump Failed: {e}")
+                # Fallback to copy if ID extraction fails
+                try: await sent_msg.copy(DUMP_CHANNEL)
+                except: pass
+        
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
         return True
-    except: return False
+    except Exception as e: 
+        print(f"Upload Error: {e}")
+        return False
 
 # ==========================================
 #           DOWNLOAD LOGIC
@@ -289,7 +323,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
 # ==========================================
 async def process_task(client, message, url, mode="auto", upload_target="tg", queue_pos=None):
     user_id = message.from_user.id
-    try: msg = await message.reply_text("☁️ **Initializing...**")
+    try: msg = await message.reply_text("☁️ <b>Initializing...</b>")
     except: return
 
     try:
@@ -299,16 +333,16 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
 
         file_path = await download_logic(url, msg, user_id, mode, queue_pos)
         
-        if str(file_path).startswith("ERROR"): await msg.edit_text(f"❌ **Failed!**\nReason: `{str(file_path)}`"); return
+        if str(file_path).startswith("ERROR"): await msg.edit_text(f"❌ <b>Failed!</b>\nReason: <code>{str(file_path)}</code>"); return
         if file_path == "CANCELLED": await msg.edit_text("❌ Task Cancelled."); return
         if not file_path or not os.path.exists(file_path): await msg.edit_text("❌ Download Failed."); return
         
         file_path = str(file_path); final_files = []; temp_dir = None; is_extracted = False
         if os.path.isdir(file_path):
-            await msg.edit_text(f"📂 **Processing Folder...**\n`{os.path.basename(file_path)}`")
+            await msg.edit_text(f"📂 <b>Processing Folder...</b>\n<code>{os.path.basename(file_path)}</code>")
             final_files = get_files_from_folder(file_path)
         elif file_path.lower().endswith((".zip", ".rar", ".7z", ".tar")):
-            await msg.edit_text(f"📦 **Extracting...**\n`{os.path.basename(file_path)}`")
+            await msg.edit_text(f"📦 <b>Extracting...</b>\n<code>{os.path.basename(file_path)}</code>")
             extracted_list, temp_dir, error_msg = extract_archive(file_path)
             if error_msg: final_files = [file_path]
             else: final_files = extracted_list; is_extracted = True; os.remove(file_path)
@@ -319,9 +353,10 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
         if upload_target == "rclone":
             for f in final_files: await rclone_upload_file(msg, f, queue_pos)
         else:
-            await msg.edit_text(f"☁️ **Uploading {len(final_files)} Files...**")
+            await msg.edit_text(f"☁️ <b>Uploading {len(final_files)} Files...</b>")
             for f in final_files:
                 if os.path.getsize(f) < 1024*10: continue
+                # Pass 'client' properly for dumping
                 await upload_file(client, msg, f, message.from_user.mention, queue_pos)
         
         if is_extracted or os.path.isdir(file_path): 
@@ -336,7 +371,7 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
 
         await msg.delete(); aria2.purge()
         if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    except Exception as e: await msg.edit_text(f"⚠️ Error: `{escape_md(str(e))}`"); traceback.print_exc()
+    except Exception as e: await msg.edit_text(f"⚠️ Error: <code>{str(e)}</code>"); traceback.print_exc()
 
 async def queue_manager(client, user_id):
     if is_processing.get(user_id, False): return
@@ -346,14 +381,14 @@ async def queue_manager(client, user_id):
         queue_status = f"1/{len(user_queues[user_id]) + 1}"
         await process_task(client, message, link, mode, target, queue_pos=queue_status)
     is_processing[user_id] = False
-    await client.send_message(user_id, "✅ **Queue Completed!**")
+    await client.send_message(user_id, "✅ <b>Queue Completed!</b>")
 
 # ==========================================
 #           COMMANDS
 # ==========================================
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
-    caption = "**👋 Bot Started!**\n☁️ [Powered by Ayuprime](tg://user?id=8493596199)\n\n📥 **Usage:**\n• Send Link -> Leech\n• `/rclone link` -> Cloud\n• `/queue link1 link2` -> Queue"
+    caption = "<b>👋 Bot Started!</b>\n☁️ <a href='tg://user?id=8493596199'>Powered by Ayuprime</a>\n\n📥 <b>Usage:</b>\n• Send Link -> Leech\n• <code>/rclone link</code> -> Cloud\n• <code>/queue link1 link2</code> -> Queue"
     try: await m.reply_photo(photo="start_img.jpg", caption=caption)
     except: await m.reply_text(caption)
 
@@ -370,7 +405,7 @@ async def command_handler(c, m):
         if user_id not in user_queues: user_queues[user_id] = []
         for link in links:
             if link.startswith("http") or link.startswith("magnet:"): user_queues[user_id].append((link, m, mode, target))
-        await m.reply_text(f"✅ **Added to Queue.**"); asyncio.create_task(queue_manager(c, user_id))
+        await m.reply_text(f"✅ <b>Added to Queue.</b>"); asyncio.create_task(queue_manager(c, user_id))
     else:
         for link in links:
             if link.startswith("http") or link.startswith("magnet:"): asyncio.create_task(process_task(c, m, link, mode, target))
@@ -386,33 +421,26 @@ async def cancel(c, cb):
     except: await cb.answer("Error.")
 
 # ==========================================
-#           SERVER & STARTUP (FIXED)
+#           SERVER & STARTUP
 # ==========================================
 async def main():
-    # Start Bot
     print("🤖 Starting Bot Client...")
     await app.start()
     print("✅ Bot Started!")
 
-    # Start Web Server
     print("🌍 Starting Web Server...")
     async def handle(request): return web.Response(text="Bot Running")
     web_app = web.Application()
     web_app.router.add_get("/", handle)
     runner = web.AppRunner(web_app)
     await runner.setup()
-    
-    # FIXED SYNTAX HERE: Added "0.0.0.0" and PORT
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"✅ Web Server running on Port {PORT}")
 
-    # Keep Idle
     await idle()
     await app.stop()
 
 if __name__ == "__main__":
-    # FIXED STARTUP LOGIC: Using get_event_loop().run_until_complete(main())
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-    
