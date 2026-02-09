@@ -446,6 +446,7 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
         if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         
     except Exception as e: 
+        # Fixed syntax error here
         await msg.edit_text(f"⚠️ Error: <code>{str(e)}</code>")
         traceback.print_exc()
 
@@ -464,4 +465,66 @@ async def queue_manager(client, user_id):
 # ==========================================
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
-    caption = "<b>👋 Bot Started!</b>\n☁️ <a href='tg://user?id=8493596199'>Powered by Ayuprime</a>\n\n📥 <b>Usage:</b>\n• Send Link -> Leech\n• <code>/rclone link</code> -> Cloud\n• <code>/queue link1 link2</cod 
+    # Using triple quotes to safely handle multi-line strings
+    caption = """<b>👋 Bot Started!</b>
+☁️ <a href='tg://user?id=8493596199'>Powered by Ayuprime</a>
+
+📥 <b>Usage:</b>
+• Send Link -> Leech
+• <code>/rclone link</code> -> Cloud
+• <code>/queue link1 link2</code> -> Queue"""
+    try: await m.reply_photo(photo="start_img.jpg", caption=caption)
+    except: await m.reply_text(caption)
+
+@app.on_message(filters.command(["leech", "rclone", "queue", "ytdl"]))
+async def command_handler(c, m):
+    cmd = m.command[0]; user_id = m.from_user.id
+    text = m.reply_to_message.text if m.reply_to_message else (m.text.split(None, 1)[1] if len(m.command) > 1 else "")
+    if not text: await m.reply_text("❌ No link!"); return
+
+    links = text.strip().split(); mode = "ytdl" if cmd == "ytdl" else "auto"
+    target = "rclone" if cmd == "rclone" else "tg"
+    
+    if cmd == "queue":
+        if user_id not in user_queues: user_queues[user_id] = []
+        for link in links:
+            if link.startswith("http") or link.startswith("magnet:"): user_queues[user_id].append((link, m, mode, target))
+        await m.reply_text(f"✅ <b>Added to Queue.</b>"); asyncio.create_task(queue_manager(c, user_id))
+    else:
+        for link in links:
+            if link.startswith("http") or link.startswith("magnet:"): asyncio.create_task(process_task(c, m, link, mode, target))
+
+@app.on_message(filters.text & filters.private)
+async def auto_cmd(c, m):
+    if not m.text.startswith("/") and (m.text.startswith("http") or m.text.startswith("magnet:")):
+        asyncio.create_task(process_task(c, m, m.text, "auto", "tg"))
+
+@app.on_callback_query(filters.regex(r"cancel_(\d+)"))
+async def cancel(c, cb):
+    try: abort_dict[int(cb.data.split("_")[1])] = True; await cb.answer("Cancelling...")
+    except: await cb.answer("Error.")
+
+# ==========================================
+#           SERVER & STARTUP
+# ==========================================
+async def main():
+    print("🤖 Starting Bot Client...")
+    await app.start()
+    print("✅ Bot Started!")
+
+    print("🌍 Starting Web Server...")
+    async def handle(request): return web.Response(text="Bot Running")
+    web_app = web.Application()
+    web_app.router.add_get("/", handle)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"✅ Web Server running on Port {PORT}")
+
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
