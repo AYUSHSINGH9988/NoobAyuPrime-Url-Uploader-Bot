@@ -13,6 +13,7 @@ import urllib.parse
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
+from aiohttp import web
 
 # --- Environment Variables ---
 API_ID = int(os.environ.get("API_ID"))
@@ -360,7 +361,9 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
     except: return # If msg failed
 
     try:
-        if mongo_db: await users_col.update_one({"_id": user_id}, {"$set": {"active": True}}, upsert=True)
+        # --- FIXED LINE HERE (Replaced 'if mongo_db:' with 'if mongo_db is not None:') ---
+        if mongo_db is not None: 
+            await users_col.update_one({"_id": user_id}, {"$set": {"active": True}}, upsert=True)
 
         file_path = await download_logic(url, msg, user_id, mode, queue_pos)
         
@@ -508,24 +511,9 @@ async def cancel(c, cb):
     except:
         await cb.answer("Error cancelling.")
 
-# --- Web Server ---
-from aiohttp import web
-
 async def web_server():
     async def handle(request):
         return web.Response(text="Bot Running")
 
     app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    # Ye wali line dhyan se copy karein, poori honi chahiye
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-if __name__ == "__main__":
-    app.start()
-    app.loop.run_until_complete(web_server())
-    app.loop.run_forever()
-    
+    app.router.add_
