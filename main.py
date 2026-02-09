@@ -510,10 +510,22 @@ async def cancel(c, cb):
 
 # --- Web Server ---
 from aiohttp import web
+
 async def web_server():
-    async def handle(request): return web.Response(text="Bot Running")
+    async def handle(request):
+        return web.Response(text="Bot Running")
+
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, 
+    
+    # Ye wali line dhyan se copy karein, poori honi chahiye
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+if __name__ == "__main__":
+    app.start()
+    app.loop.run_until_complete(web_server())
+    app.loop.run_forever()
+    
