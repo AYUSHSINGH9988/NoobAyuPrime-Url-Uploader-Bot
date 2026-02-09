@@ -24,7 +24,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URL = os.environ.get("MONGO_URL")
 RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:")
 
-# Dump Channel ID
 try:
     DUMP_CHANNEL = int(str(os.environ.get("DUMP_CHANNEL", "0")).strip())
 except:
@@ -219,7 +218,6 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
         
         caption = f"☁️ <b>File:</b> {clean_html(file_name)}\n📦 <b>Size:</b> <code>{humanbytes(os.path.getsize(file_path))}</code>\n👤 <b>User:</b> {user_mention}"
         
-        # Upload to User
         sent_msg = await message.reply_document(
             document=file_path, 
             caption=caption, 
@@ -229,10 +227,8 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
             progress_args=(message, time.time(), "☁️ Uploading...", file_name, queue_pos)
         )
         
-        # --- DUMP LOGIC ---
         if DUMP_CHANNEL != 0:
             try:
-                # Use File ID for reliability
                 file_id = sent_msg.document.file_id if sent_msg.document else sent_msg.video.file_id
                 await client.send_document(
                     chat_id=DUMP_CHANNEL, 
@@ -251,27 +247,24 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
         return False
 
 # ==========================================
-#           DOWNLOAD LOGIC (FIXED)
+#           DOWNLOAD LOGIC
 # ==========================================
 async def download_logic(url, message, user_id, mode, queue_pos=None):
-    # --- 1. PIXELDRAIN PRE-PROCESSING (API Check) ---
+    # --- 1. PIXELDRAIN PRE-PROCESSING ---
     pd_filename = None
     if "pixeldrain.com" in url:
         try:
-            # ID Extraction
             if "/u/" in url:
                 file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
             else:
                 file_id = url.split("/")[-1]
             
-            # API Call for Metadata
             api_url = f"https://pixeldrain.com/api/file/{file_id}/info"
             async with aiohttp.ClientSession() as session:
                 async with session.get(api_url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         pd_filename = data.get("name")
-                        # Convert to Download Link
                         url = f"https://pixeldrain.com/api/file/{file_id}"
         except Exception as e:
             print(f"Pixeldrain API Error: {e}")
@@ -284,7 +277,6 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
         if url.startswith("magnet:") or url.endswith(".torrent"):
             try:
                 if url.endswith(".torrent"):
-                    # Download .torrent file first
                     async with aiohttp.ClientSession() as session:
                         async with session.get(url) as resp:
                             if resp.status != 200: return "ERROR: Torrent File Download Failed"
@@ -296,7 +288,6 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                 
                 gid = download.gid
                 
-                # Aria2 Monitoring Loop
                 while True:
                     if message.id in abort_dict:
                         aria2.remove([gid])
@@ -310,7 +301,6 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                         elif status.status == "error":
                             return "ERROR: Aria2 Download Failed"
                             
-                        # Update Progress
                         completed = int(status.completed_length)
                         total = int(status.total_length)
                         if total > 0:
@@ -339,7 +329,6 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     info = ydl.extract_info(url, download=False)
                     filename_display = info.get('title', 'YouTube Video')
                     
-                    # Size Check
                     if info.get('filesize', 0) > YTDLP_LIMIT:
                         return "ERROR: Video larger than 2GB limit"
                         
@@ -349,18 +338,15 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
             except Exception as e:
                 return f"ERROR: YT-DLP - {str(e)}"
 
-        # --- 4. DIRECT LINK / PIXELDRAIN LOGIC (FIXED) ---
+        # --- 4. DIRECT LINK / PIXELDRAIN LOGIC ---
         else:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         total = int(resp.headers.get("content-length", 0))
-                        
-                        # --- FILENAME DETECTION ---
-                        name = pd_filename # Agar Pixeldrain se mila to wo use karo
+                        name = pd_filename 
                         
                         if not name:
-                            # Try from Headers
                             try:
                                 if "Content-Disposition" in resp.headers:
                                     cd = resp.headers["Content-Disposition"]
@@ -369,19 +355,15 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                             except: pass
                         
                         if not name:
-                            # Try from URL
                             name = os.path.basename(str(url)).split("?")[0]
                         
-                        # Fallback
                         if not name: name = "downloaded_file"
                         if "." not in name: name += ".mp4"
                         
-                        # Clean Filename
                         name = urllib.parse.unquote(name)
                         file_path = name
                         filename_display = name
 
-                        # Download Loop
                         f = await aiofiles.open(file_path, mode='wb')
                         dl_size = 0
                         start_time = time.time()
@@ -394,7 +376,6 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                             await f.write(chunk)
                             dl_size += len(chunk)
                             
-                            # Throttle UI Updates (Every 4s)
                             if (time.time() - last_update > 4) or (dl_size == total):
                                 await update_progress_ui(
                                     dl_size, total, message, start_time, 
@@ -430,29 +411,26 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
         
         file_path = str(file_path); final_files = []; temp_dir = None; is_extracted = False
         
-        # Check for Folder or Archive
         if os.path.isdir(file_path):
             await msg.edit_text(f"📂 <b>Processing Folder...</b>\n<code>{os.path.basename(file_path)}</code>")
             final_files = get_files_from_folder(file_path)
         elif file_path.lower().endswith((".zip", ".rar", ".7z", ".tar")):
             await msg.edit_text(f"📦 <b>Extracting...</b>\n<code>{os.path.basename(file_path)}</code>")
             extracted_list, temp_dir, error_msg = extract_archive(file_path)
-            if error_msg: final_files = [file_path] # Extract fail hua to original file upload karo
+            if error_msg: final_files = [file_path]
             else: final_files = extracted_list; is_extracted = True; os.remove(file_path)
         else: final_files = [file_path]
         
         if not final_files: await msg.edit_text("❌ No files found."); return
         
-        # Uploading
         if upload_target == "rclone":
             for f in final_files: await rclone_upload_file(msg, f, queue_pos)
         else:
             await msg.edit_text(f"☁️ <b>Uploading {len(final_files)} Files...</b>")
             for f in final_files:
-                if os.path.getsize(f) < 1024*10: continue # Skip very small files
+                if os.path.getsize(f) < 1024*10: continue
                 await upload_file(client, msg, f, message.from_user.mention, queue_pos)
         
-        # Cleanup
         if is_extracted or os.path.isdir(file_path): 
             try: shutil.rmtree(file_path) 
             except: pass
@@ -468,4 +446,22 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
         if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         
     except Exception as e: 
-        await msg.edit_text(f"⚠️ Error: <c 
+        await msg.edit_text(f"⚠️ Error: <code>{str(e)}</code>")
+        traceback.print_exc()
+
+async def queue_manager(client, user_id):
+    if is_processing.get(user_id, False): return
+    is_processing[user_id] = True
+    while user_id in user_queues and user_queues[user_id]:
+        task = user_queues[user_id].pop(0); link, message, mode, target = task
+        queue_status = f"1/{len(user_queues[user_id]) + 1}"
+        await process_task(client, message, link, mode, target, queue_pos=queue_status)
+    is_processing[user_id] = False
+    await client.send_message(user_id, "✅ <b>Queue Completed!</b>")
+
+# ==========================================
+#           COMMANDS
+# ==========================================
+@app.on_message(filters.command("start"))
+async def start_cmd(c, m):
+    caption = "<b>👋 Bot Started!</b>\n☁️ <a href='tg://user?id=8493596199'>Powered by Ayuprime</a>\n\n📥 <b>Usage:</b>\n• Send Link -> Leech\n• <code>/rclone link</code> -> Cloud\n• <code>/queue link1 link2</cod 
