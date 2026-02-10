@@ -336,8 +336,8 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
 # ==========================================
 #           DOWNLOAD LOGIC (FIXED)
 # ==========================================
-async def download_logic(url, message, user_id, mode, queue_pos=None):
-    # --- Pixeldrain ---
+  async def download_logic(url, message, user_id, mode, queue_pos=None):
+    # --- 1. Pixeldrain Pre-Processing ---
     pd_filename = None
     if "pixeldrain.com" in url:
         try:
@@ -359,17 +359,39 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
     try:
         file_path = None
         
-        # --- Torrent ---
+        # --- 2. TORRENT / MAGNET (TRACKERS ADDED) ---
         if url.startswith("magnet:") or url.endswith(".torrent"):
+            # 🚀 High Speed Trackers List
+            trackers = [
+                "udp://tracker.opentrackr.org:1337/announce",
+                "udp://open.stealth.si:80/announce",
+                "udp://tracker.torrent.eu.org:451/announce",
+                "udp://tracker.bittor.pw:1337/announce",
+                "udp://public.popcorn-tracker.org:6969/announce",
+                "udp://tracker.dler.org:6969/announce",
+                "udp://venus.tweb.at:6969/announce",
+                "udp://tracker.openbittorrent.com:80/announce",
+                "udp://tracker.internetwarriors.net:1337/announce",
+                "udp://tracker.leechers-paradise.org:6969/announce"
+            ]
+
             try:
-                if url.endswith(".torrent"):
+                # A. Magnet Link Handling
+                if url.startswith("magnet:"):
+                    # Magnet link me trackers inject karna
+                    for t in trackers:
+                        if t not in url:
+                            url += f"&tr={urllib.parse.quote(t)}"
+                    download = aria2.add_magnet(url)
+
+                # B. Torrent File Handling
+                else: 
                     async with aiohttp.ClientSession() as session:
                         async with session.get(url) as resp:
                             if resp.status != 200: return "ERROR: Torrent File Download Failed"
                             with open("task.torrent", "wb") as f: f.write(await resp.read())
-                    download = aria2.add_torrent("task.torrent")
-                else: 
-                    download = aria2.add_magnet(url)
+                    # Torrent file options me trackers daalna
+                    download = aria2.add_torrent("task.torrent", options={"bt-tracker": ",".join(trackers)})
                 
                 gid = download.gid
                 
@@ -384,14 +406,18 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                             file_path = status.files[0].path
                             break
                         elif status.status == "error": 
-                            return "ERROR: Aria2 Download Failed"
+                            return "ERROR: Aria2 Download Failed (No Seeds)"
                         
                         completed = int(status.completed_length)
                         total = int(status.total_length)
-                        if total > 0: 
+                        
+                        # Metadata Check (Agar size 0 hai to Metadata download ho rha hai)
+                        status_msg = "☁️ Downloading Metadata..." if total == 0 else "☁️ Torrent Downloading..."
+
+                        if total > 0 or (time.time() % 4 < 1): # Metadata ke waqt bhi update kare
                             await update_progress_ui(
                                 completed, total, message, time.time(), 
-                                "☁️ Torrent Downloading...", status.name, queue_pos
+                                status_msg, status.name, queue_pos
                             )
                     except: 
                         await asyncio.sleep(2)
@@ -401,7 +427,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
             except Exception as e: 
                 return f"ERROR: Aria2 - {str(e)}"
 
-        # --- YouTube ---
+        # --- 3. YouTube ---
         elif "youtube.com" in url or "youtu.be" in url or mode == "ytdl":
             try:
                 ydl_opts = {
@@ -422,7 +448,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
             except Exception as e: 
                 return f"ERROR: YT-DLP - {str(e)}"
 
-        # --- Direct HTTP (FIXED NAME LOGIC) ---
+        # --- 4. Direct HTTP (Same Fixed Logic) ---
         else:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
@@ -434,7 +460,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     # 1. Try Pixeldrain Name
                     name = pd_filename
                     
-                    # 2. Try Header Name (Content-Disposition) - THIS WAS MISSING
+                    # 2. Try Header Name (Content-Disposition)
                     if not name:
                         try:
                             if "Content-Disposition" in resp.headers:
