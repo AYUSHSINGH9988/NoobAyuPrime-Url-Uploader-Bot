@@ -336,7 +336,7 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
 # ==========================================
 #           DOWNLOAD LOGIC (FIXED)
 # ==========================================
-  async def download_logic(url, message, user_id, mode, queue_pos=None):
+async def download_logic(url, message, user_id, mode, queue_pos=None):
     # --- 1. Pixeldrain Pre-Processing ---
     pd_filename = None
     if "pixeldrain.com" in url:
