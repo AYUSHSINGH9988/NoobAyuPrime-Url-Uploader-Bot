@@ -541,4 +541,104 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
         try:
             await msg.edit_text(f"⚠️ Process Error: {e}")
         except:
-            pa
+            pass
+        traceback.print_exc()
+
+# ==========================================
+#           QUEUE MANAGER
+# ==========================================
+async def queue_manager(client, user_id):
+    if is_processing.get(user_id, False): 
+        return
+        
+    is_processing[user_id] = True
+    
+    while user_queues.get(user_id):
+        task = user_queues[user_id].pop(0)
+        link = task[0]
+        msg_obj = task[1]
+        mode = task[2]
+        target = task[3]
+        
+        q_text = f"1/{len(user_queues[user_id])+1}"
+        await process_task(client, msg_obj, link, mode, target, q_text)
+        
+    is_processing[user_id] = False
+    await client.send_message(user_id, "✅ <b>Queue Processed Successfully!</b>")
+
+# ==========================================
+#           COMMAND HANDLERS
+# ==========================================
+@app.on_message(filters.command("start"))
+async def start_cmd(c, m):
+    welcome_text = """
+👋 <b>Welcome to Ayuprime Video Tool Bot!</b>
+
+☁️ <b>I can upload files to Telegram & Cloud (Rclone).</b>
+
+<b>Commands:</b>
+• <code>/leech [link]</code> - Upload to Telegram
+• <code>/rclone [link]</code> - Upload to Cloud
+• <code>/ytdl [link]</code> - Force YouTube-DL mode
+• <code>/queue [links]</code> - Add multiple links to queue
+    """
+    await m.reply_text(welcome_text)
+
+@app.on_message(filters.command(["leech", "rclone", "queue", "ytdl"]))
+async def command_handler(c, m):
+    if not m.reply_to_message and len(m.command) < 2: 
+        await m.reply_text("❌ <b>Please send a link!</b>")
+        return
+        
+    text = m.reply_to_message.text if m.reply_to_message else m.text.split(None, 1)[1]
+    links = text.split()
+    
+    cmd = m.command[0]
+    target = "rclone" if cmd == "rclone" else "tg"
+    mode = "ytdl" if cmd == "ytdl" else "auto"
+
+    if cmd == "queue":
+        if m.from_user.id not in user_queues: 
+            user_queues[m.from_user.id] = []
+        for l in links: 
+            user_queues[m.from_user.id].append((l, m, mode, target))
+        await m.reply_text(f"✅ <b>Added {len(links)} Links to Queue!</b>")
+        asyncio.create_task(queue_manager(c, m.from_user.id))
+    else:
+        for l in links: 
+            asyncio.create_task(process_task(c, m, l, mode, target))
+
+@app.on_message(filters.text & filters.private)
+async def auto_cmd(c, m):
+    if not m.text.startswith("/") and ("http" in m.text or "magnet:" in m.text): 
+        asyncio.create_task(process_task(c, m, m.text))
+
+@app.on_callback_query(filters.regex(r"cancel_(\d+)"))
+async def cancel(c, cb):
+    msg_id = int(cb.data.split("_")[1])
+    abort_dict[msg_id] = True
+    await cb.answer("🛑 Task Cancelled!")
+
+# ==========================================
+#           SERVER & STARTUP
+# ==========================================
+async def main():
+    print("🤖 Bot Starting...")
+    print(f"📡 DUMP CHANNEL ID: {DUMP_CHANNEL}")
+    
+    await app.start()
+    print("✅ Bot Started Successfully!")
+
+    web_app = web.Application()
+    web_app.router.add_get("/", lambda r: web.Response(text="Bot is Running"))
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    print(f"🌍 Web Server running on Port {PORT}")
+
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
