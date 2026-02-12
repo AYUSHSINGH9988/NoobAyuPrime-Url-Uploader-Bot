@@ -307,12 +307,11 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     if info.get('filesize', 0) > YTDLP_LIMIT: return "ERROR: Video size larger than 2GB Limit"
                     ydl.download([url])
                     file_path = ydl.prepare_filename(info)
-            except Exception as e: return f"ERROR: YT-DLP - {str(e)}"
+                    except Exception as e: 
+            return f"ERROR: YT-DLP - {str(e)}"
                 
-                          
-                
-                status_msg = "☁️ Processing YouTube (720p Max)..."
-                await message.edit_text(status_msg)
+        status_msg = "☁️ Processing YouTube (720p Max)..."
+        await message.edit_text(status_msg)
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
