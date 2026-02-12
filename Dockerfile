@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# 1. Install Dependencies
+# System dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     aria2 \
@@ -12,16 +12,15 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Rclone (Updated Method)
+# Rclone install
 RUN curl https://rclone.org/install.sh | bash
 
-# 3. Python Reqs
+# Python dependencies
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# 4. Copy Code
+# Copy Code
 COPY . .
 
-# 5. Permissions & Start Command (Is line ko dhyan se copy karna)
-RUN chmod +x start.sh
-CMD ["bash", "start.sh"]
+# Run Command
+CMD ["python3", "main.py"]
