@@ -277,15 +277,13 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     await asyncio.sleep(2)
             except Exception as e: return f"ERROR: Aria2 - {str(e)}"
 
-                # --- YouTube / YT-DLP (720p Limit + Cookies) ---
+        # --- YouTube / YT-DLP (720p Limit + Cookies) ---
         elif "youtube.com" in url or "youtu.be" in url or mode == "ytdl":
             try:
-                # Check for cookies.txt
                 cookie_path = "cookies.txt"
                 has_cookies = os.path.exists(cookie_path)
                 
                 ydl_opts = {
-                    # Forces Max 720p resolution
                     'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
                     'outtmpl': '%(title)s.%(ext)s', 
                     'noplaylist': True, 
@@ -296,30 +294,20 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                 }
                 
                 status_msg = "☁️ Processing YouTube (720p Max)..."
-                
-                # --- FIX: Message Not Modified Error Fix ---
-                try: await message.edit_text(status_msg)
-                except: pass
-                # -------------------------------------------
+                try: 
+                    await message.edit_text(status_msg)
+                except: 
+                    pass
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-                    if info.get('filesize', 0) > YTDLP_LIMIT: return "ERROR: Video size larger than 2GB Limit"
+                    if info.get('filesize', 0) > YTDLP_LIMIT: 
+                        return "ERROR: Video size larger than 2GB Limit"
                     ydl.download([url])
                     file_path = ydl.prepare_filename(info)
-                    except Exception as e: 
-            return f"ERROR: YT-DLP - {str(e)}"
-                
-        status_msg = "☁️ Processing YouTube (720p Max)..."
-        await message.edit_text(status_msg)
-
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info.get('filesize', 0) > YTDLP_LIMIT: return "ERROR: Video size larger than 2GB Limit"
-                    ydl.download([url])
-                    file_path = ydl.prepare_filename(info)
-            except Exception as e: return f"ERROR: YT-DLP - {str(e)}"
-
+            except Exception as e: 
+                return f"ERROR: YT-DLP - {str(e)}"
+             
         # --- Direct HTTP ---
         else:
             async with aiohttp.ClientSession() as session:
@@ -340,21 +328,22 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     if "." not in name: name += ".mp4"
                     file_path = name
 
-                    f = await aiofiles.open(file_path, mode='wb')
-                    dl_size = 0
-                    start_time = time.time()
-                    async for chunk in resp.content.iter_chunked(1024*1024):
-                        if message.id in abort_dict: 
-                            await f.close(); 
-                            if os.path.exists(file_path): os.remove(file_path)
-                            return "CANCELLED"
-                        await f.write(chunk)
-                        dl_size += len(chunk)
-                        await update_progress_ui(dl_size, total, message, start_time, "☁️ Downloading...", file_path, queue_pos)
-                    await f.close()
+                    async with aiofiles.open(file_path, mode='wb') as f:
+                        dl_size = 0
+                        start_time = time.time()
+                        async for chunk in resp.content.iter_chunked(1024*1024):
+                            if message.id in abort_dict: 
+                                if os.path.exists(file_path): os.remove(file_path)
+                                return "CANCELLED"
+                            await f.write(chunk)
+                            dl_size += len(chunk)
+                            await update_progress_ui(dl_size, total, message, start_time, "☁️ Downloading...", file_path, queue_pos)
+        
         return str(file_path) if file_path else None
-    except Exception as e: return f"ERROR: {str(e)}"
 
+    except Exception as e: 
+        return f"ERROR: {str(e)}"
+                
 # ==========================================
 #           PROCESSOR
 # ==========================================
