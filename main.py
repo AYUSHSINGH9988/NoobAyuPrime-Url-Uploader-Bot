@@ -14,7 +14,7 @@ from aiohttp import web
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:") # Example: "Gdrive:"
+RCLONE_PATH = os.environ.get("RCLONE_PATH", "remote:") 
 PORT = int(os.environ.get("PORT", 8080))
 
 # --- Dump Channel Logic ---
@@ -31,8 +31,8 @@ app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- Globals ---
 aria2 = None
-user_queues = {}   # Format: {user_id: [(link, mode, target, message_obj)]}
-is_processing = {} # Format: {user_id: True/False}
+user_queues = {}   
+is_processing = {} 
 
 # ==================== HELPERS ====================
 def humanbytes(size):
@@ -86,7 +86,6 @@ async def rclone_upload(message, path):
         if not line: break
         decoded = line.decode().strip()
         
-        # Parse Progress from Rclone Output
         if "Transferred" in decoded and "%" in decoded:
             now = time.time()
             if now - last_edit > 5:
@@ -133,6 +132,11 @@ async def process_task(client, message, link, mode, target):
         msg = await message.reply_text(f"⏳ <b>Starting Task...</b>\nTarget: {target.upper()}")
         path = None
         
+        # --- PIXELDRAIN FIX ---
+        if "pixeldrain.com" in link:
+            if "/u/" in link:
+                link = link.replace("/u/", "/api/file/")
+        
         # --- DOWNLOAD ---
         if "magnet" in link or link.endswith(".torrent"):
             if not aria2: return await msg.edit_text("❌ Aria2 Not Running!")
@@ -153,7 +157,7 @@ async def process_task(client, message, link, mode, target):
                 await asyncio.sleep(3)
                 await progress_bar(int(s.completed_length), int(s.total_length), msg, time.time(), "⬇️ Downloading...", s.name)
         else:
-            # YTDL / Direct
+            # YTDL / Direct / Pixeldrain
             opts = {'outtmpl': '%(title)s.%(ext)s', 'quiet': True}
             with yt_dlp.YoutubeDL(opts) as y:
                 info = y.extract_info(link, download=True)
@@ -175,7 +179,7 @@ async def queue_manager(client, user_id):
         task = user_queues[user_id].pop(0)
         link, mode, target, m = task
         await process_task(client, m, link, mode, target)
-        await asyncio.sleep(2) # Cool down
+        await asyncio.sleep(2) 
     
     del is_processing[user_id]
     await client.send_message(user_id, "✅ <b>All Queue Tasks Finished!</b>")
@@ -206,7 +210,6 @@ async def add_task(c, m):
         if not is_processing.get(m.from_user.id):
             asyncio.create_task(queue_manager(c, m.from_user.id))
     else:
-        # Direct Execution
         asyncio.create_task(process_task(c, m, link, mode, target))
 
 # ==================== MAIN ====================
@@ -214,7 +217,6 @@ async def main():
     global aria2
     print("🤖 Bot Starting...")
     
-    # Rclone Check
     if os.path.exists("rclone.conf"): print("✅ Found rclone.conf")
     else: print("⚠️ Warning: rclone.conf NOT FOUND!")
 
@@ -236,4 +238,3 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-    
