@@ -1,4 +1,4 @@
-import os
+iimport os
 import time
 import asyncio
 import aiohttp
@@ -265,6 +265,87 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     if message.id in abort_dict: 
                         aria2.remove([gid])
                         return "CANCELLED"
+                    try:
+                        status = aria2.get_download(gid)
+                        if status.status == "complete": 
+                            file_path = status.files[0].path; break
+                        elif status.status == "error": return "ERROR: Aria2 Download Failed"
+                        elif status.status == "removed": return "CANCELLED"
+                        
+                        await update_progress_ui(int(status.completed_length), int(status.total_length), message, time.time(), "☁️ Torrent Downloading...", status.name, queue_pos)
+                    except: await asyncio.sleep(2); continue
+                    await asyncio.sleep(2)
+            except Exception as e: return f"ERROR: Aria2 - {str(e)}"
+
+        # --- YouTube / YT-DLP (Fixed Formatting & Indentation) ---
+        elif "youtube.com" in url or "youtu.be" in url or mode == "ytdl":
+            try:
+                # Check for cookies.txt
+                cookie_path = "cookies.txt"
+                has_cookies = os.path.exists(cookie_path)
+                
+                ydl_opts = {
+                    # Forces Max 720p, fallback to BEST available if 720p fails
+                    'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/bestvideo+bestaudio/best',
+                    'outtmpl': '%(title)s.%(ext)s', 
+                    'noplaylist': True, 
+                    'quiet': True,
+                    'merge_output_format': 'mp4',
+                    'writethumbnail': True,
+                    'cookiefile': cookie_path if has_cookies else None
+                }
+                
+                status_msg = "☁️ Processing YouTube..."
+                
+                # --- FIX: Message Not Modified Error Fix ---
+                try: 
+                    await message.edit_text(status_msg)
+                except: 
+                    pass
+                # -------------------------------------------
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info.get('filesize', 0) > YTDLP_LIMIT: return "ERROR: Video size larger than 2GB Limit"
+                    ydl.download([url])
+                    file_path = ydl.prepare_filename(info)
+            except Exception as e: return f"ERROR: YT-DLP - {str(e)}"
+
+        # --- Direct HTTP ---
+        else:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200: return f"ERROR: HTTP {resp.status}"
+                    total = int(resp.headers.get("content-length", 0))
+                    
+                    name = pd_filename
+                    if not name and "Content-Disposition" in resp.headers:
+                        try:
+                            cd = resp.headers["Content-Disposition"]
+                            if 'filename="' in cd: name = cd.split('filename="')[1].split('"')[0]
+                            elif "filename=" in cd: name = cd.split("filename=")[1].split(";")[0]
+                        except: pass
+                    
+                    if not name: name = os.path.basename(str(url)).split("?")[0]
+                    name = urllib.parse.unquote(name)
+                    if "." not in name: name += ".mp4"
+                    file_path = name
+
+                    f = await aiofiles.open(file_path, mode='wb')
+                    dl_size = 0
+                    start_time = time.time()
+                    async for chunk in resp.content.iter_chunked(1024*1024):
+                        if message.id in abort_dict: 
+                            await f.close(); 
+                            if os.path.exists(file_path): os.remove(file_path)
+                            return "CANCELLED"
+                        await f.write(chunk)
+                        dl_size += len(chunk)
+                        await update_progress_ui(dl_size, total, message, start_time, "☁️ Downloading...", file_path, queue_pos)
+                    await f.close()
+        return str(file_path) if file_path else None
+    except Exception as e: return f"ERROR: {str(e)}"
+                    
                     try:
                         status = aria2.get_download(gid)
                         if status.status == "complete": 
