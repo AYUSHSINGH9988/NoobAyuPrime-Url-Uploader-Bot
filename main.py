@@ -4,8 +4,10 @@ import asyncio
 import aiohttp
 import yt_dlp
 import aria2p
+import subprocess
 import shutil
 import re
+import urllib.parse
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
@@ -33,8 +35,9 @@ app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 aria2 = None
 user_queues = {}   
 is_processing = {} 
+progress_status = {}
 
-# ==================== HELPERS ====================
+# ==================== UI HELPERS (OLD STYLE) ====================
 def humanbytes(size):
     if not size: return "0B"
     dic = {0: ' ', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti'}
@@ -42,22 +45,43 @@ def humanbytes(size):
     while size > 1024: size /= 1024; n += 1
     return f"{round(size, 2)} {dic[n]}B"
 
+def time_formatter(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def clean_filename(name):
+    # Fix %20 to Space
+    name = urllib.parse.unquote_plus(name)
+    return name.replace("<", "").replace(">", "").replace(":", "")
+
 async def progress_bar(current, total, message, start, action, name):
     now = time.time()
-    if (now - progress_bar.last < 5) and (current != total): return
-    progress_bar.last = now
+    last = progress_status.get(message.id, 0)
+    if (now - last < 3) and (current != total): return
+    progress_status[message.id] = now
+    
     pct = current * 100 / total if total else 0
     speed = current / (now - start) if now > start else 0
+    eta = round((total - current) / speed) if speed > 0 else 0
     
-    text = f"📂 <b>{name}</b>\n"
-    text += f"<b>{action}</b>\n"
-    text += f"☁️ {'☁️' * int(pct // 10)}{'◌' * (10 - int(pct // 10))} <code>{round(pct, 1)}%</code>\n"
-    text += f"💾 <code>{humanbytes(current)} / {humanbytes(total)}</code>\n"
-    text += f"🚀 <code>{humanbytes(speed)}/s</code>"
+    # OLD UI STYLE
+    filled = int(pct // 10)
+    bar = '☁️' * filled + '◌' * (10 - filled)
+    
+    text = f"""☁️ <b>Powered by Ayuprime</b>
+
+📂 <b>File:</b> {clean_filename(name)}
+<b>{action}</b>
+
+{bar} <code>{round(pct, 1)}%</code>
+
+💾 <b>Size:</b> <code>{humanbytes(current)} / {humanbytes(total)}</code>
+🚀 <b>Speed:</b> <code>{humanbytes(speed)}/s</code>
+⏳ <b>ETA:</b> <code>{time_formatter(eta)}</code>"""
     
     try: await message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data=f"cancel_{message.id}")]]))
     except: pass
-progress_bar.last = 0
 
 async def take_ss(video):
     thumb = f"{video}.jpg"
@@ -69,7 +93,7 @@ async def take_ss(video):
 
 # ==================== UPLOAD LOGIC ====================
 async def rclone_upload(message, path):
-    name = os.path.basename(path)
+    name = clean_filename(os.path.basename(path))
     if not os.path.exists("rclone.conf"):
         return await message.edit_text("❌ <b>Error:</b> <code>rclone.conf</code> not found!")
     
@@ -78,9 +102,7 @@ async def rclone_upload(message, path):
     cmd = ["rclone", "copy", path, RCLONE_PATH, "--config", "rclone.conf", "-P"]
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     
-    start_time = time.time()
     last_edit = 0
-    
     while True:
         line = await proc.stdout.readline()
         if not line: break
@@ -88,11 +110,21 @@ async def rclone_upload(message, path):
         
         if "Transferred" in decoded and "%" in decoded:
             now = time.time()
-            if now - last_edit > 5:
+            if now - last_edit > 4:
                 match = re.search(r"(\d+)%", decoded)
                 pct = match.group(1) if match else "0"
+                
+                # Rclone UI
+                filled = int(int(pct) // 10)
+                bar = '☁️' * filled + '◌' * (10 - filled)
+                
+                text = f"""🚀 <b>Rclone Uploading...</b>
+📂 <b>File:</b> {name}
+
+{bar} <code>{pct}%</code>
+⚡ <b>Status:</b> {decoded.split(',')[1].strip() if ',' in decoded else 'Uploading'}"""
                 try:
-                    await message.edit_text(f"🚀 <b>Rclone Uploading...</b>\n📂 {name}\n📊 <b>Progress:</b> <code>{pct}%</code>")
+                    await message.edit_text(text)
                     last_edit = now
                 except: pass
                 
@@ -104,137 +136,178 @@ async def rclone_upload(message, path):
         await message.edit_text(f"❌ <b>Rclone Failed!</b>\n<code>{err.decode()[:300]}</code>")
 
 async def telegram_upload(client, message, path):
-    name = os.path.basename(path)
+    name = clean_filename(os.path.basename(path))
     thumb = await take_ss(path)
-    caption = f"📂 {name}\n📦 {humanbytes(os.path.getsize(path))}"
+    caption = f"☁️ <b>File:</b> {name}\n📦 <b>Size:</b> <code>{humanbytes(os.path.getsize(path))}"
     
-    target = DUMP_CHANNEL if DUMP_CHANNEL != 0 else message.chat.id
-    
-    try:
-        sent = await client.send_document(
-            chat_id=target, document=path, thumb=thumb, caption=caption,
-            progress=progress_bar, progress_args=(message, time.time(), "☁️ Uploading...", name)
-        )
-        if DUMP_CHANNEL != 0:
+    # 1. Try DUMP Channel
+    if DUMP_CHANNEL != 0:
+        try:
+            sent = await client.send_document(
+                chat_id=DUMP_CHANNEL, document=path, thumb=thumb, caption=caption,
+                progress=progress_bar, progress_args=(message, time.time(), "☁️ Uploading to Dump...", name)
+            )
             link = f"https://t.me/c/{str(DUMP_CHANNEL)[4:]}/{sent.id}"
             await message.edit_text(f"✅ <b>Done!</b>\n<a href='{link}'>View in Channel</a>", disable_web_page_preview=True)
-        else:
-            await message.edit_text("✅ <b>Upload Complete!</b>")
-            
+            if thumb: os.remove(thumb)
+            return
+        except Exception as e:
+            await message.edit_text(f"❌ <b>Dump Upload Failed!</b>\nError: <code>{e}</code>\n\n<i>Falling back to Private Chat...</i>")
+            await asyncio.sleep(2)
+    
+    # 2. Fallback to User
+    try:
+        await client.send_document(
+            chat_id=message.chat.id, document=path, thumb=thumb, caption=caption,
+            progress=progress_bar, progress_args=(message, time.time(), "☁️ Uploading...", name)
+        )
+        await message.delete()
     except Exception as e:
         await message.edit_text(f"❌ <b>Upload Failed!</b>\n<code>{e}</code>")
     
     if thumb and os.path.exists(thumb): os.remove(thumb)
 
-# ==================== PROCESSOR & QUEUE ====================
+# ==================== DOWNLOAD & PROCESS ====================
 async def process_task(client, message, link, mode, target):
     try:
-        msg = await message.reply_text(f"⏳ <b>Starting Task...</b>\nTarget: {target.upper()}")
+        msg = await message.reply_text(f"⏳ <b>Initializing...</b>")
         path = None
         
-        # --- PIXELDRAIN FIX ---
-        if "pixeldrain.com" in link:
-            if "/u/" in link:
-                link = link.replace("/u/", "/api/file/")
-        
-        # --- DOWNLOAD ---
+        # Pixeldrain Logic
+        if "pixeldrain.com" in link and "/u/" in link:
+            link = link.replace("/u/", "/api/file/")
+
+        # --- TORRENT/MAGNET ---
         if "magnet" in link or link.endswith(".torrent"):
-            if not aria2: return await msg.edit_text("❌ Aria2 Not Running!")
-            if "magnet" in link: dl = aria2.add_magnet(link)
-            else:
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(link) as r:
-                        with open("task.torrent", "wb") as f: f.write(await r.read())
-                dl = aria2.add_torrent("task.torrent")
+            if not aria2: return await msg.edit_text("❌ Aria2 Daemon Not Running!")
             
-            gid = dl.gid
+            try:
+                if "magnet" in link: 
+                    download = aria2.add_magnet(link)
+                else:
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(link) as r:
+                            with open("task.torrent", "wb") as f: f.write(await r.read())
+                    download = aria2.add_torrent("task.torrent")
+            except Exception as e:
+                return await msg.edit_text(f"❌ Aria2 Error: {e}")
+            
+            gid = download.gid
+            
+            # Monitoring Loop (Fixed 'tell_status' error)
             while True:
-                s = aria2.tell_status(gid)
-                if s.status == "complete": 
-                    path = s.files[0].path; break
-                elif s.status == "error": 
-                    return await msg.edit_text("❌ Torrent Error")
-                await asyncio.sleep(3)
-                await progress_bar(int(s.completed_length), int(s.total_length), msg, time.time(), "⬇️ Downloading...", s.name)
+                try:
+                    # Use get_download instead of tell_status to avoid AttributeErrors
+                    curr_dl = aria2.get_download(gid)
+                    
+                    if curr_dl.status == "complete":
+                        path = curr_dl.files[0].path
+                        break
+                    elif curr_dl.status == "error":
+                        return await msg.edit_text("❌ Torrent Error")
+                    elif curr_dl.status == "removed":
+                         return await msg.edit_text("❌ Task Cancelled")
+
+                    await progress_bar(
+                        int(curr_dl.completed_length), 
+                        int(curr_dl.total_length), 
+                        msg, time.time(), 
+                        "⬇️ Downloading Torrent...", 
+                        curr_dl.name
+                    )
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    print(f"Monitor Error: {e}")
+                    await asyncio.sleep(2)
+
+        # --- YTDL / DIRECT ---
         else:
-            # YTDL / Direct / Pixeldrain
             opts = {'outtmpl': '%(title)s.%(ext)s', 'quiet': True}
-            with yt_dlp.YoutubeDL(opts) as y:
-                info = y.extract_info(link, download=True)
-                path = y.prepare_filename(info)
-        
+            try:
+                with yt_dlp.YoutubeDL(opts) as y:
+                    info = y.extract_info(link, download=True)
+                    path = y.prepare_filename(info)
+            except Exception as e:
+                return await msg.edit_text(f"❌ Download Error: {e}")
+
         # --- UPLOAD ---
         if path:
+            # Fix Filename Spaces before Upload
+            new_name = clean_filename(os.path.basename(path))
+            new_path = os.path.join(os.path.dirname(path), new_name)
+            os.rename(path, new_path)
+            path = new_path
+            
             if target == "rclone": await rclone_upload(msg, path)
             else: await telegram_upload(client, msg, path)
             
             if os.path.exists(path): os.remove(path)
-            
-    except Exception as e:
-        await message.reply_text(f"❌ Error: {e}")
 
+    except Exception as e:
+        await message.reply_text(f"❌ Critical Error: {e}")
+
+# ==================== QUEUE MANAGER ====================
 async def queue_manager(client, user_id):
     is_processing[user_id] = True
     while user_id in user_queues and user_queues[user_id]:
         task = user_queues[user_id].pop(0)
         link, mode, target, m = task
         await process_task(client, m, link, mode, target)
-        await asyncio.sleep(2) 
-    
     del is_processing[user_id]
     await client.send_message(user_id, "✅ <b>All Queue Tasks Finished!</b>")
 
 # ==================== COMMANDS ====================
 @app.on_message(filters.command("start"))
 async def start(c, m):
-    await m.reply_text("👋 <b>Bot Ready!</b>\n\n/leech [link] - Telegram Upload\n/rclone [link] - Drive Upload\n/queue [link] - Add to Telegram Queue\n/queue_rc [link] - Add to Rclone Queue")
+    await m.reply_text(f"👋 <b>Bot Ready!</b>\nDump ID: <code>{DUMP_CHANNEL}</code>")
 
 @app.on_message(filters.command(["leech", "rclone", "queue", "queue_rc"]))
 async def add_task(c, m):
     if len(m.command) < 2: return await m.reply_text("❌ Give me a link!")
     link = m.command[1]
     cmd = m.command[0]
-    
-    # Determine Mode & Target
     target = "rclone" if "rclone" in cmd or "rc" in cmd else "telegram"
-    mode = "auto"
-    is_queue = "queue" in cmd
     
-    if is_queue:
+    if "queue" in cmd:
         if m.from_user.id not in user_queues: user_queues[m.from_user.id] = []
-        user_queues[m.from_user.id].append((link, mode, target, m))
-        
-        pos = len(user_queues[m.from_user.id])
-        await m.reply_text(f"✅ <b>Added to Queue!</b>\nPosition: {pos}\nTarget: {target.upper()}")
-        
+        user_queues[m.from_user.id].append((link, "auto", target, m))
+        await m.reply_text(f"✅ Added to Queue ({len(user_queues[m.from_user.id])})")
         if not is_processing.get(m.from_user.id):
             asyncio.create_task(queue_manager(c, m.from_user.id))
     else:
-        asyncio.create_task(process_task(c, m, link, mode, target))
+        asyncio.create_task(process_task(c, m, link, "auto", target))
+
+@app.on_callback_query(filters.regex(r"cancel_"))
+async def cancel(c, cb):
+    await cb.message.delete()
 
 # ==================== MAIN ====================
 async def main():
     global aria2
     print("🤖 Bot Starting...")
-    
-    if os.path.exists("rclone.conf"): print("✅ Found rclone.conf")
-    else: print("⚠️ Warning: rclone.conf NOT FOUND!")
 
-    # Aria2 Check (Started by start.sh)
-    try:
-        aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
-        print("✅ Aria2 Connected!")
-    except:
-        print("❌ Aria2 Failed (Check start.sh)")
+    # FORCE START ARIA2 (No start.sh needed)
+    if shutil.which("aria2c"):
+        try:
+            print("🚀 Starting Aria2c Daemon...")
+            subprocess.Popen(["aria2c", "--enable-rpc", "--rpc-listen-port=6800", "--daemon", "--allow-overwrite=true"])
+            await asyncio.sleep(3) # Wait for it to start
+            
+            # Connect
+            aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
+            print("✅ Aria2 Connected Successfully!")
+        except Exception as e:
+            print(f"❌ Aria2 Connection Failed: {e}")
+    else:
+        print("❌ Aria2c Binary Not Found!")
 
     await app.start()
-    
     runner = web.AppRunner(web.Application())
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
+                                           
