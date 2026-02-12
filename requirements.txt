@@ -2,7 +2,7 @@ pyrogram
 tgcrypto
 aiohttp
 aiofiles
-yt-dlp>=2024.03.10
+yt-dlp>=2024.08.06
 aria2p
 motor
 dnspython
