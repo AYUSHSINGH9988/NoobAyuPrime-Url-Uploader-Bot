@@ -277,7 +277,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     await asyncio.sleep(2)
             except Exception as e: return f"ERROR: Aria2 - {str(e)}"
 
-        # --- YouTube / YT-DLP (720p Limit + Cookies) ---
+                # --- YouTube / YT-DLP (720p Limit + Cookies) ---
         elif "youtube.com" in url or "youtu.be" in url or mode == "ytdl":
             try:
                 # Check for cookies.txt
@@ -308,6 +308,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     ydl.download([url])
                     file_path = ydl.prepare_filename(info)
             except Exception as e: return f"ERROR: YT-DLP - {str(e)}"
+                
                           
                 
                 status_msg = "☁️ Processing YouTube (720p Max)..."
