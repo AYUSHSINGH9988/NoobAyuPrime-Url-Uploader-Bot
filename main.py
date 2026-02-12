@@ -282,9 +282,10 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
             try:
                 cookie_path = "cookies.txt"
                 has_cookies = os.path.exists(cookie_path)
-                
+
                 ydl_opts = {
-                    'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+                    # --- FIX: Added '/best' at the end as backup ---
+                    'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
                     'outtmpl': '%(title)s.%(ext)s', 
                     'noplaylist': True, 
                     'quiet': True,
@@ -293,7 +294,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     'cookiefile': cookie_path if has_cookies else None
                 }
                 
-                status_msg = "☁️ Processing YouTube (720p Max)..."
+                 status_msg = "☁️ Processing YouTube (720p Max)..."
                 try: 
                     await message.edit_text(status_msg)
                 except: 
