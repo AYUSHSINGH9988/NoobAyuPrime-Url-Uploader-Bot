@@ -296,7 +296,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     'socket_timeout': 10,
                     'nocheckcertificate': True,
                     'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                }
+                } 
                 
                 status_msg = "☁️ Processing YouTube..."
                 try: await message.edit_text(status_msg)
