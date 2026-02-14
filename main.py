@@ -310,47 +310,58 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
         return False
 
 # ==========================================
-#           DOWNLOAD LOGIC (Aria2 Fixed)
+#           DOWNLOAD LOGIC (FIXED)
 # ==========================================
 async def download_logic(url, message, user_id, mode, queue_pos=None):
+    # --- TRACKERS (Essential for Magnet Links) ---
+    TRACKERS = [
+        "http://tracker.opentrackr.org:1337/announce",
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://tracker.openbittorrent.com:80/announce",
+        "udp://tracker.torrent.eu.org:451/announce",
+        "udp://explodie.org:6969/announce",
+        "udp://tracker.doko.moe:6969/announce",
+        "http://tracker.openbittorrent.com:80/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://tracker.coppersurfer.tk:6969/announce",
+        "udp://tracker.leechers-paradise.org:6969/announce",
+    ]
+    tracker_str = ",".join(TRACKERS)
+
     # --- Pixeldrain Fix ---
     pd_filename = None
     if "pixeldrain.com" in url:
         try:
-            if "/u/" in url:
-                file_id = url.split("pixeldrain.com/u/")[1].split("/")[0]
-            else:
-                file_id = url.split("/")[-1]
-                
+            file_id = url.split("pixeldrain.com/u/")[1].split("/")[0] if "/u/" in url else url.split("/")[-1]
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"https://pixeldrain.com/api/file/{file_id}/info") as resp:
                     if resp.status == 200: 
                         data = await resp.json()
                         pd_filename = data.get("name")
-            
-            # Convert to API link for download
             url = f"https://pixeldrain.com/api/file/{file_id}"
-        except Exception as e:
-            print(f"Pixeldrain Info Error: {e}")
+        except Exception as e: print(f"Pixeldrain Info Error: {e}")
     
     headers = {"User-Agent": "Mozilla/5.0"}
     
     try:
         file_path = None
         
-        # --- Torrent / Magnet ---
+        # 1. --- Torrent / Magnet ---
         if url.startswith("magnet:") or url.endswith(".torrent"):
             if not aria2: return "ERROR: Aria2c is not running!"
             
             try:
+                # Add Trackers to options
+                options = {'bt-tracker': tracker_str}
+
                 if url.startswith("magnet:"):
-                    download = aria2.add_magnet(url)
+                    download = aria2.add_magnet(url, options=options)
                 else: 
                     async with aiohttp.ClientSession() as session:
                         async with session.get(url, headers=headers) as resp:
                             if resp.status != 200: return "ERROR: Torrent File Download Failed"
                             with open("task.torrent", "wb") as f: f.write(await resp.read())
-                    download = aria2.add_torrent("task.torrent")
+                    download = aria2.add_torrent("task.torrent", options=options)
                 
                 gid = download.gid
                 
@@ -360,23 +371,24 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                         return "CANCELLED"
                         
                     try:
-                        # FIX: Use get_download instead of tell_status
                         status = aria2.get_download(gid)
                         
                         if status.status == "complete": 
-                            file_path = status.files[0].path
+                            file_path = str(status.files[0].path)
                             break
                         elif status.status == "error": 
                             return "ERROR: Aria2 Download Failed"
                         elif status.status == "removed":
                             return "CANCELLED"
                         
-                        completed = int(status.completed_length)
-                        total = int(status.total_length)
+                        # Stop Seeding logic
+                        if status.total_length > 0 and status.completed_length >= status.total_length:
+                             file_path = str(status.files[0].path)
+                             break
                         
                         await update_progress_ui(
-                            completed, total, message, time.time(), 
-                            "☁️ Torrent Downloading...", status.name, queue_pos
+                            int(status.completed_length), int(status.total_length), message, time.time(), 
+                            f"☁️ Downloading ({status.num_seeders} Seeds)...", status.name, queue_pos
                         )
                     except Exception as e: 
                         print(f"Aria2 Stats Error: {e}")
@@ -387,57 +399,37 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
             except Exception as e: 
                 return f"ERROR: Aria2 - {str(e)}"
 
-        # --- YouTube / Direct ---
+        # 2. --- YouTube / YT-DLP ---
         elif "youtube.com" in url or "youtu.be" in url or mode == "ytdl":
             try:
-                ydl_opts = {
-                    'format': 'bestvideo+bestaudio/best', 
-                    'outtmpl': '%(title)s.%(ext)s', 
-                    'noplaylist': True, 
-                    'quiet': True
-                }
+                ydl_opts = {'format': 'bestvideo+bestaudio/best', 'outtmpl': '%(title)s.%(ext)s', 'noplaylist': True, 'quiet': True}
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-                    if info.get('filesize', 0) > YTDLP_LIMIT: 
-                        return "ERROR: Video size larger than 2GB Limit"
+                    if info.get('filesize', 0) > YTDLP_LIMIT: return "ERROR: Video size larger than 2GB Limit"
                     ydl.download([url])
                     file_path = ydl.prepare_filename(info)
-            except Exception as e: 
-                return f"ERROR: YT-DLP - {str(e)}"
+            except Exception as e: return f"ERROR: YT-DLP - {str(e)}"
 
-        # --- Direct HTTP (Filename Logic Restored) ---
+        # 3. --- Direct HTTP ---
         else:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers) as resp:
-                    if resp.status != 200: 
-                        return f"ERROR: HTTP {resp.status}"
-                        
+                    if resp.status != 200: return f"ERROR: HTTP {resp.status}"
                     total = int(resp.headers.get("content-length", 0))
                     
-                    # 1. Use Pixeldrain name if available
                     name = pd_filename
-                    
-                    # 2. Try to get filename from Content-Disposition
                     if not name and "Content-Disposition" in resp.headers:
                         try:
                             cd = resp.headers["Content-Disposition"]
-                            if 'filename="' in cd:
-                                name = cd.split('filename="')[1].split('"')[0]
-                            elif "filename=" in cd:
-                                name = cd.split("filename=")[1].split(";")[0]
-                        except: 
-                            pass
+                            if 'filename="' in cd: name = cd.split('filename="')[1].split('"')[0]
+                            elif "filename=" in cd: name = cd.split("filename=")[1].split(";")[0]
+                        except: pass
                     
-                    # 3. Fallback to URL
-                    if not name:
-                        name = os.path.basename(str(url)).split("?")[0]
-                    
-                    # Fix encoded names and ensure extension
+                    if not name: name = os.path.basename(str(url)).split("?")[0]
                     name = urllib.parse.unquote(name)
                     if "." not in name: name += ".mp4"
                     
                     file_path = name
-
                     f = await aiofiles.open(file_path, mode='wb')
                     dl_size = 0
                     start_time = time.time()
@@ -447,20 +439,15 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                             await f.close()
                             if os.path.exists(file_path): os.remove(file_path)
                             return "CANCELLED"
-                        
                         await f.write(chunk)
                         dl_size += len(chunk)
-                        
-                        await update_progress_ui(
-                            dl_size, total, message, start_time, 
-                            "☁️ Downloading...", file_path, queue_pos
-                        )
+                        await update_progress_ui(dl_size, total, message, start_time, "☁️ Downloading...", file_path, queue_pos)
                     await f.close()
                     
         return str(file_path) if file_path else None
     except Exception as e: 
         return f"ERROR: {str(e)}"
-
+                                         
 # ==========================================
 #           PROCESSOR (QUEUE & UPLOAD)
 # ==========================================
@@ -610,58 +597,66 @@ async def cancel(c, cb):
     await cb.answer("🛑 Task Cancelled!")
 
 # ==========================================
-#           SERVER & STARTUP
+#           MAIN RUNNER
 # ==========================================
 async def main():
     print("🤖 Bot Starting...")
-    print(f"📡 DUMP CHANNEL ID: {DUMP_CHANNEL}")
-    
-    # 1. Setup Database
-    global mongo_client, mongo_db, users_col
-    if MONGO_URL:
-        try:
-            mongo_client = AsyncIOMotorClient(MONGO_URL)
-            mongo_db = mongo_client["URL_Uploader_Bot"]
-            users_col = mongo_db["users"]
-            print("✅ MongoDB Connected Successfully!")
-        except Exception as e:
-            print(f"❌ MongoDB Error: {e}")
-            
-    # 2. Setup Aria2 (Manual Robust Start)
     global aria2
+
+    # 1. Kill old aria2c instances (Prevents port jamming)
     try:
-        # Popen use karenge taaki wo background me chale
-        if shutil.which("aria2c"):
-            cmd = ['aria2c', '--enable-rpc', '--rpc-listen-port=6800', '--daemon', '--seed-time=0', '--max-connection-per-server=10', '--follow-torrent=mem', '--allow-overwrite=true']
+        subprocess.run(["pkill", "-9", "aria2c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except: pass
+
+    # 2. Setup Aria2
+    if shutil.which("aria2c"):
+        try:
+            cmd = [
+                'aria2c', 
+                '--enable-rpc', 
+                '--rpc-listen-port=6800', 
+                '--rpc-secret=my_secret_token', # Added Secret
+                '--daemon', 
+                '--allow-overwrite=true', 
+                '--max-connection-per-server=10',
+                '--seed-time=0',
+                '--seed-ratio=0.0',
+                '--follow-torrent=mem'
+            ]
             subprocess.Popen(cmd)
-            print("⏳ Aria2c daemon launched, waiting 5s...")
-            await asyncio.sleep(5) # Wait for it to fully start
+            print("⏳ Starting Aria2c...")
+            await asyncio.sleep(4) # Give it time to boot
             
-            # Connect via library
-            aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
-            print("✅ Aria2 Connected via RPC!")
-        else:
-             print("❌ Aria2c Binary NOT FOUND!")
-             
-    except Exception as e:
-        print(f"❌ Aria2 Error: {e}")
+            # Connect using the secret
+            aria2 = aria2p.API(aria2p.Client(
+                host="http://localhost", 
+                port=6800, 
+                secret="my_secret_token"
+            ))
+            
+            # Test Connection
+            print(f"✅ Aria2 Connected! Version: {aria2.get_global_option().get('aria2-version')}")
+        except Exception as e:
+            print(f"❌ Aria2 Start Failed: {e}")
+            aria2 = None
+    else:
+        print("❌ Error: 'aria2c' binary not found. Install it (apt install aria2)")
 
     # 3. Start Bot
     await app.start()
-    print("✅ Bot Started Successfully!")
-
-    # 4. Start Web Server (Required for Koyeb)
+    
+    # 4. Web Server
     web_app = web.Application()
-    web_app.router.add_get("/", lambda r: web.Response(text="Bot is Running"))
+    web_app.router.add_get("/", lambda r: web.Response(text="Bot Running"))
     runner = web.AppRunner(web_app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     print(f"🌍 Web Server running on Port {PORT}")
 
-    # 5. Keep Alive
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-          
+
+      
