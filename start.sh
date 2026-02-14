@@ -10,3 +10,4 @@ sleep 3
 # 3. Start the Bot
 echo "🤖 Starting Bot..."
 python3 main.py
+ 
