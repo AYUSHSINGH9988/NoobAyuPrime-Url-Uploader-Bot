@@ -449,77 +449,120 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
         return f"ERROR: {str(e)}"
                                          
 # ==========================================
-#           PROCESSOR (QUEUE & UPLOAD)
+#           PROCESSOR (UPDATED)
 # ==========================================
 async def process_task(client, message, url, mode="auto", upload_target="tg", queue_pos=None):
-    try: 
-        msg = await message.reply_text("☁️ <b>Initializing Task...</b>")
-    except: 
-        return
+    try: msg = await message.reply_text("☁️ <b>Initializing Task...</b>")
+    except: return
 
     try:
-        # 1. Download
-        file_path = await download_logic(url, msg, message.from_user.id, mode, queue_pos)
+        file_path = None
         
+        # --- A. TELEGRAM FILE DOWNLOAD (FIXED PATH) ---
+        if not url and message.reply_to_message:
+            media = message.reply_to_message.document or message.reply_to_message.video
+            
+            # 1. Get Filename
+            fname = getattr(media, 'file_name', None)
+            if not fname: fname = f"tg_file_{int(time.time())}"
+            
+            # 2. Set Exact Path (downloads folder)
+            if not os.path.exists("downloads"): os.makedirs("downloads")
+            file_path = os.path.join("downloads", fname)
+            
+            await msg.edit_text(f"📥 <b>Downloading from TG...</b>\n<code>{clean_html(fname)}</code>")
+            
+            # 3. Capture Returned Path (Most Important Fix)
+            file_path = await message.reply_to_message.download(
+                file_name=file_path, 
+                progress=update_progress_ui, 
+                progress_args=(msg, time.time(), "📥 Downloading...", fname, queue_pos)
+            )
+            
+            if not file_path:
+                await msg.edit_text("❌ TG Download Failed!")
+                return
+        
+        # --- B. URL DOWNLOAD ---
+        elif url:
+            file_path = await download_logic(url, msg, message.from_user.id, mode, queue_pos)
+        
+        # Check Failures
         if not file_path or str(file_path).startswith("ERROR") or file_path == "CANCELLED":
             await msg.edit_text(f"❌ Failed: {file_path}")
             return
 
+        # --- EXTRACT CHECK ---
         final_files = []
         is_extracted = False
         
-        # 2. Extract
-        if os.path.isdir(file_path):
-            await msg.edit_text(f"📂 <b>Processing Folder...</b>")
-            final_files = get_files_from_folder(file_path)
-        
-        elif file_path.lower().endswith((".zip", ".rar", ".7z", ".tar")):
-            await msg.edit_text(f"📦 <b>Extracting Archive...</b>\n(This might take some time)")
-            extracted_list, temp_dir, error_msg = extract_archive(file_path)
+        # Force string path
+        file_path_str = str(file_path)
+        original_name = os.path.basename(file_path_str)
+
+        # Smart Check: Extension OR MimeType detection
+        # (Agar extension .mp4 hai par file zip hai, to bhi pakad lega)
+        is_archive = False
+        if file_path_str.lower().endswith(('.zip', '.rar', '.7z', '.tar', '.gz', '.iso', '.xz')):
+            is_archive = True
+        elif re.search(r'\.\d{3}$', file_path_str): # Split files .001
+            is_archive = True
+        else:
+            # Deep Check for renamed files
+            try:
+                mime = subprocess.check_output(['file', '--mime-type', '-b', file_path_str]).decode().strip()
+                if "zip" in mime or "archive" in mime: is_archive = True
+            except: pass
+
+        if is_archive:
+            await msg.edit_text(f"📦 <b>Extracting Archive...</b>")
+            extracted_list, temp_dir, error_msg = extract_archive(file_path_str)
             
-            if error_msg: 
-                final_files = [file_path]
-            else: 
+            if not error_msg and extracted_list:
                 final_files = extracted_list
                 is_extracted = True
-                if os.path.isfile(file_path): 
-                    try: os.remove(file_path)
-                    except: pass
-        else: 
-            final_files = [file_path]
+                if os.path.isfile(file_path_str): os.remove(file_path_str)
+            else:
+                final_files = [file_path_str] # Extract fail hua to original upload
+        else:
+            final_files = [file_path_str]
 
-        # 3. Upload
+        # --- PIN HEADER (DUMP) ---
+        if DUMP_CHANNEL != 0:
+            try:
+                pin_title = os.path.splitext(original_name)[0]
+                pin_msg = await client.send_message(DUMP_CHANNEL, f"📌 <b>Batch Upload:</b>\n<code>{clean_html(pin_title)}</code>")
+                await pin_msg.pin(both_sides=True)
+            except: pass
+
+        # --- UPLOAD ---
         if upload_target == "rclone":
-             for f in final_files: 
-                 await rclone_upload_file(msg, f, queue_pos)
+            for f in final_files: await rclone_upload_file(msg, f, queue_pos)
         else:
             await msg.edit_text(f"☁️ <b>Uploading {len(final_files)} Files...</b>")
-            
             for index, f in enumerate(final_files):
-                if os.path.getsize(f) < 1: continue
+                if message.id in abort_dict: break
                 current_status = f"{index+1}/{len(final_files)}"
-                # Pass Client to allow sending to channel
-                await upload_file(client, msg, f, message.from_user.mention, current_status)
+                
+                # Retry logic for upload
+                uploaded = await upload_file(client, msg, f, message.from_user.mention, current_status)
+                if not uploaded:
+                    await asyncio.sleep(2)
+                    await upload_file(client, msg, f, message.from_user.mention, current_status)
+                
                 await asyncio.sleep(2) 
         
-        # 4. Cleanup
-        if is_extracted: 
-            try: shutil.rmtree(os.path.dirname(final_files[0]))
-            except: pass
-        elif os.path.isfile(file_path): 
-            try: os.remove(file_path)
-            except: pass
-
-        # await msg.delete() # Don't delete immediately to show success
-        if aria2: aria2.purge() 
+        # --- CLEANUP ---
+        if is_extracted: shutil.rmtree(temp_dir, ignore_errors=True)
+        elif os.path.isfile(file_path_str): os.remove(file_path_str)
         
-    except Exception as e: 
-        try:
-            await msg.edit_text(f"⚠️ Process Error: {e}")
-        except:
-            pass
+        if message.id not in abort_dict:
+            await msg.edit_text("✅ <b>Task Completed!</b>")
+            
+    except Exception as e:
         traceback.print_exc()
-
+        await msg.edit_text(f"⚠️ Error: {e}")
+                                
 # ==========================================
 #           QUEUE MANAGER
 # ==========================================
