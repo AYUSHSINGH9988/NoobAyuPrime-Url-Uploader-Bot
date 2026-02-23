@@ -632,7 +632,8 @@ async def main():
                 port=6800, 
                 secret="my_secret_token"
             ))
-            print(f"✅ Aria2 Connected! Version: {aria2.get_global_option().get('aria2-version')}")
+            # ✅ FIX: Yahan se version print karne wala code hata diya, jisse crash ho raha tha
+            print("✅ Aria2 Connected Successfully!")
         except Exception as e:
             print(f"❌ Aria2 Start Failed: {e}")
             aria2 = None
@@ -653,5 +654,5 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-                      
-  
+
+        
