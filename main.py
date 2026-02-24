@@ -267,7 +267,7 @@ async def upload_file(client, message, file_path, user_mention, queue_pos=None):
 # ==========================================
 #           DOWNLOAD LOGIC
 # ==========================================
-async def download_logic(url, message, user_id, mode, queue_pos=None):
+async def download_logic(url, message, user_id, mode, queue_pos=None, custom_name=None):
     TRACKERS = [
         "http://tracker.opentrackr.org:1337/announce",
         "udp://tracker.opentrackr.org:1337/announce",
@@ -282,7 +282,6 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
     ]
     tracker_str = ",".join(TRACKERS)
 
-    # ✅ FIX: Pixeldrain Auto-Converter (Webpage to Direct File with Original Name)
     pd_filename = None
     if "pixeldrain.com" in url:
         try:
@@ -306,6 +305,9 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
             
             try:
                 options = {'bt-tracker': tracker_str}
+                if custom_name and not url.startswith("magnet:"): 
+                    options['out'] = custom_name
+                    
                 if url.startswith("magnet:"):
                     download = aria2.add_magnet(url, options=options)
                 else: 
@@ -326,7 +328,6 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                         status = aria2.get_download(gid)
                         
                         if status.status == "complete": 
-                            # ✅ FIX: Multi-file torrent ka pura folder uthayega
                             if len(status.files) > 1:
                                 base_dir = str(status.dir)
                                 rel_path = os.path.relpath(str(status.files[0].path), base_dir)
@@ -362,14 +363,21 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                 return f"ERROR: Aria2 - {str(e)}"
 
         # 2. --- YouTube / YT-DLP ---
-        elif "youtube.com" in url or "youtu.be" in url or mode == "ytdl":
+        elif "youtube.com" in url or "youtu.be" in url or mode == "ytdl" or "m3u8" in url:
             try:
-                ydl_opts = {'format': 'bestvideo+bestaudio/best', 'outtmpl': '%(title)s.%(ext)s', 'noplaylist': True, 'quiet': True}
+                # ✅ FIX: YTDLP Custom Name injection
+                out_name = custom_name if custom_name else '%(title)s.%(ext)s'
+                ydl_opts = {'format': 'bestvideo+bestaudio/best', 'outtmpl': out_name, 'noplaylist': True, 'quiet': True}
+                
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     if info.get('filesize', 0) > YTDLP_LIMIT: return "ERROR: Video size larger than 2GB Limit"
                     ydl.download([url])
                     file_path = ydl.prepare_filename(info)
+                    
+                    # Agar custom name diya hai, toh file path wahi hoga
+                    if custom_name and os.path.exists(custom_name):
+                        file_path = custom_name
             except Exception as e: return f"ERROR: YT-DLP - {str(e)}"
 
         # 3. --- Direct HTTP ---
@@ -391,7 +399,8 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
                     name = urllib.parse.unquote(name)
                     if "." not in name: name += ".mp4"
                     
-                    file_path = name
+                    # ✅ FIX: HTTP Custom Name Priority
+                    file_path = custom_name if custom_name else name
                     f = await aiofiles.open(file_path, mode='wb')
                     dl_size = 0
                     start_time = time.time()
@@ -413,7 +422,7 @@ async def download_logic(url, message, user_id, mode, queue_pos=None):
 # ==========================================
 #           PROCESSOR
 # ==========================================
-async def process_task(client, message, url, mode="auto", upload_target="tg", queue_pos=None):
+async def process_task(client, message, url, mode="auto", upload_target="tg", queue_pos=None, custom_name=None):
     try: msg = await message.reply_text("☁️ <b>Initializing Task...</b>")
     except: return
 
@@ -422,7 +431,7 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
         
         if not url and message.reply_to_message:
             media = message.reply_to_message.document or message.reply_to_message.video or message.reply_to_message.photo
-            fname = getattr(media, 'file_name', None)
+            fname = custom_name if custom_name else getattr(media, 'file_name', None)
             if not fname: fname = f"tg_file_{int(time.time())}"
             if not os.path.exists("downloads"): os.makedirs("downloads")
             file_path = os.path.join("downloads", fname)
@@ -436,7 +445,7 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
                 await msg.edit_text("❌ TG Download Failed!")
                 return
         elif url:
-            file_path = await download_logic(url, msg, message.from_user.id, mode, queue_pos)
+            file_path = await download_logic(url, msg, message.from_user.id, mode, queue_pos, custom_name)
         
         if not file_path or str(file_path).startswith("ERROR") or file_path == "CANCELLED":
             await msg.edit_text(f"❌ Failed: {file_path}")
@@ -463,7 +472,6 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
             await msg.edit_text(f"📦 <b>Extracting Archive...</b>")
             extracted_list, temp_dir, error_msg = extract_archive(file_path_str)
             if not error_msg and extracted_list:
-                # ✅ FIX: Sequence Sorting applied to Extracted Archives
                 try: extracted_list.sort(key=natural_sort_key)
                 except: extracted_list.sort()
                 final_files = extracted_list
@@ -472,7 +480,6 @@ async def process_task(client, message, url, mode="auto", upload_target="tg", qu
             else:
                 final_files = [file_path_str]
         elif os.path.isdir(file_path_str):
-            # ✅ FIX: Sequence Sorting applied to Torrent Folders
             folder_files = []
             for root, dirs, files in os.walk(file_path_str):
                 for f in files: folder_files.append(os.path.join(root, f))
@@ -532,9 +539,10 @@ async def queue_manager(client, user_id):
         msg_obj = task[1]
         mode = task[2]
         target = task[3]
+        custom_name = task[4]
         
         q_text = f"1/{len(user_queues[user_id])+1}"
-        await process_task(client, msg_obj, link, mode, target, q_text)
+        await process_task(client, msg_obj, link, mode, target, q_text, custom_name)
         
     is_processing[user_id] = False
     await client.send_message(user_id, "✅ <b>Queue Processed Successfully!</b>")
@@ -555,6 +563,9 @@ async def start_cmd(c, m):
 • <code>/rclone [link]</code> - Upload to Cloud
 • <code>/ytdl [link]</code> - Force YouTube-DL mode
 • <code>/queue [links]</code> - Add multiple links to queue
+
+📝 <b>Custom Rename Example:</b>
+<code>/ytdl https://link.m3u8 | My Video Name.mp4</code>
     """
     await m.reply_text(welcome_text)
 
@@ -565,6 +576,14 @@ async def command_handler(c, m):
         return
         
     text = m.reply_to_message.text if m.reply_to_message else m.text.split(None, 1)[1]
+    
+    # ✅ FIX: Split link and custom name using '|'
+    custom_name = None
+    if "|" in text:
+        parts = text.split("|", 1)
+        text = parts[0].strip()
+        custom_name = parts[1].strip()
+        
     links = text.split()
     
     cmd = m.command[0]
@@ -575,17 +594,24 @@ async def command_handler(c, m):
         if m.from_user.id not in user_queues: 
             user_queues[m.from_user.id] = []
         for l in links: 
-            user_queues[m.from_user.id].append((l, m, mode, target))
+            user_queues[m.from_user.id].append((l, m, mode, target, custom_name))
         await m.reply_text(f"✅ <b>Added {len(links)} Links to Queue!</b>")
         asyncio.create_task(queue_manager(c, m.from_user.id))
     else:
         for l in links: 
-            asyncio.create_task(process_task(c, m, l, mode, target))
+            asyncio.create_task(process_task(c, m, l, mode, target, None, custom_name))
 
 @app.on_message(filters.text & filters.private)
 async def auto_cmd(c, m):
     if not m.text.startswith("/") and ("http" in m.text or "magnet:" in m.text): 
-        asyncio.create_task(process_task(c, m, m.text))
+        text = m.text
+        custom_name = None
+        if "|" in text:
+            parts = text.split("|", 1)
+            text = parts[0].strip()
+            custom_name = parts[1].strip()
+            
+        asyncio.create_task(process_task(c, m, text.split()[0], custom_name=custom_name))
 
 @app.on_callback_query(filters.regex(r"cancel_(\d+)"))
 async def cancel(c, cb):
@@ -627,7 +653,6 @@ async def main():
                 port=6800, 
                 secret="my_secret_token"
             ))
-            # ✅ FIX: Aria2 Version Print Error Solved
             print("✅ Aria2 Connected Successfully!")
         except Exception as e:
             print(f"❌ Aria2 Start Failed: {e}")
@@ -649,3 +674,4 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
+    
